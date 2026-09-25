@@ -131,6 +131,8 @@ test('lists the account devices, and a recovered device joins them', async ({ br
   await page.getByTestId('my-devices').click();
   await expect(page.getByTestId('device-list')).toBeVisible({ timeout: 45_000 });
   await expect(page.getByTestId('device-list').locator('li')).toHaveCount(1);
+  // Both devices carry the account name, so the marker is what tells them apart.
+  await expect(page.getByTestId('device-list').locator('li').first()).toContainText('this device');
   await page.getByLabel('Close dialog').click();
 
   // Restoring the seed phrase in a second browser profile adds a device, and the
@@ -147,6 +149,7 @@ test('lists the account devices, and a recovered device joins them', async ({ br
 
   await other.getByTestId('my-devices').click();
   await expect(other.getByTestId('device-list').locator('li')).toHaveCount(2, { timeout: 45_000 });
+  await expect(other.getByTestId('device-list').locator('li').last()).toContainText('this device');
 
   await second.close();
   await context.close();

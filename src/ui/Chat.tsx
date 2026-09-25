@@ -45,6 +45,7 @@ export function Chat({
   const [showCard, setShowCard] = useState(false);
   const [showDevices, setShowDevices] = useState(false);
   const [devices, setDevices] = useState<DeviceEntry[]>([]);
+  const [thisDevice, setThisDevice] = useState<string | null>(null);
   const [showAdd, setShowAdd] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [cardText, setCardText] = useState('');
@@ -220,7 +221,9 @@ export function Chat({
     setDevices([]);
     setError(null);
     try {
-      setDevices(await client.devices());
+      const [listing, mine] = await Promise.all([client.devices(), client.thisDeviceId()]);
+      setDevices(listing);
+      setThisDevice(mine);
     } catch (caught) {
       setError((caught as Error).message);
     }
@@ -580,7 +583,10 @@ export function Chat({
             <ul className="device-list" data-testid="device-list">
               {devices.map((device) => (
                 <li key={device.deviceId}>
-                  <div className="name">{device.name || 'unnamed device'}</div>
+                  <div className="name">
+                    {device.name || 'unnamed device'}
+                    {device.deviceId === thisDevice && <span className="muted"> · this device</span>}
+                  </div>
                   <div className="small muted mono">{device.deviceId}</div>
                   <div className="small muted">
                     mailbox {device.inbox.id.slice(0, 12)}… → {device.relays.join(', ') || 'these relays'}
