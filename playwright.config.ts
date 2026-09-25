@@ -29,7 +29,15 @@ export default defineConfig({
       url: `${RELAY_URL}/api/health`,
       reuseExistingServer: false,
       timeout: 60_000,
-      env: { NK_DISABLE_KEYRING: '1', PYTHONPATH: PYTHON_REPO },
+      env: {
+        NK_DISABLE_KEYRING: '1',
+        PYTHONPATH: PYTHON_REPO,
+        // One relay serves the whole run and every provisioning publishes a
+        // prekey bundle plus a device list; production limits would throttle it.
+        NK_BUNDLES_PER_HOUR: '100000',
+        NK_MAILBOXES_PER_HOUR: '100000',
+        NK_WRITES_PER_MINUTE: '100000',
+      },
     },
     {
       command: 'npm run preview',

@@ -39,6 +39,11 @@ IndexedDB (encrypted)      hashed capabilities only          IndexedDB (encrypte
 - **Contact cards as QR or text**, plus camera scanning where the browser allows it.
 - **Federation and failover.** Writes fan out to every relay in a card's relay
   set; reads use whichever answers; one relay failing is invisible.
+- **Multiple devices per account.** Your account is the seed phrase; each browser
+  is a device with its own mailbox and its own ratchet sessions. Restoring the
+  seed elsewhere adds that browser to your signed device list, and people who
+  already have your card start delivering there too — **My devices** shows the
+  list. History is not synced: a new device sees messages sent after it joined.
 - **Interoperable with the Python client and relay**, proven by tests (below).
 
 ## Protocol compatibility
@@ -56,12 +61,18 @@ is wire-compatible with it. Compatibility is enforced by tests, not by hope:
   handshake, text, receipts, attachments, replay rejection and relay failover.
 - `test/interop.e2e.test.ts` runs a TypeScript client against a **live Python
   client** through the same relay: cards, text, receipts and files in both
-  directions.
+  directions. Because both sides publish and read a sealed device list, this also
+  proves the multi-device format is byte-compatible across implementations.
+- `test/devices.test.ts` and `test/devices.e2e.test.ts` cover the device list:
+  sealing, tamper and wrong-key rejection, two devices of one account both
+  receiving, a device restored from the seed joining and receiving, per-device
+  attachment manifests, and the card-inbox fallback for peers with no list.
 - `test/concurrency.test.ts` runs a UI-style long-poll loop concurrently with sends and
   asserts no message is lost — it reproduces a real ratchet-state race and guards the fix.
-- `e2e/chat.spec.ts` drives two real browsers with Playwright: create accounts,
+- `e2e/chat.spec.ts` drives real browsers with Playwright: create accounts,
   exchange a message, send a file, download and verify its bytes, sign out and
-  unlock, and recover from the seed phrase.
+  unlock, recover from the seed phrase, and watch a restored account's device
+  list grow from one browser to two.
 
 ## Quick start
 
@@ -134,8 +145,8 @@ src/
   crypto/    encoding (canonical JSON, base64url, base32), KDF, AEAD,
              identity + BIP39, prekeys, X3DH, Double Ratchet, padding
   wire/      relay framing, fetch transport, HTTP + multi-relay backends
-  core/      contact cards, sessions, attachments, encrypted IndexedDB store,
-             client orchestration, account lifecycle
+  core/      contact cards, device lists, sessions, attachments, encrypted
+             IndexedDB store, client orchestration, account lifecycle
   ui/        React interface
 scripts/     Python vector generator and interop peer (test-only)
 test/        vector, relay e2e and Python interop tests
@@ -149,6 +160,13 @@ e2e/         Playwright browser tests
 - The password protects data **at rest**; it is separate from the identity, which
   is the seed phrase. Losing the password loses local history; losing the seed
   phrase loses the account.
+- The device list lives at an address anyone can derive from your public keys and
+  is sealed with a key derived from those same keys: a peer holding your card can
+  read it, and the relay sees only an opaque box — it cannot group your mailboxes
+  or link them to an identity id.
+- Restoring the seed in the **same** browser profile is the same device: this
+  client keys local state by identity id, so it reuses the existing mailbox rather
+  than registering a second one.
 - Capability tokens are bearer tokens in request headers, so an XSS on this page
   would expose them. Keep the deployment free of untrusted scripts; there is no
   third-party JS in the bundle.

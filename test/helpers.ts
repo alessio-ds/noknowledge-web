@@ -51,7 +51,17 @@ export async function startRelay(): Promise<RelayHandle> {
     ],
     {
       cwd: PYTHON_REPO,
-      env: { ...process.env, NK_DISABLE_KEYRING: '1', PYTHONPATH: PYTHON_REPO },
+      // One relay serves a whole test file and every provisioning publishes a
+      // prekey bundle plus a device list, so the production per-IP limits would
+      // throttle the suite long before it finishes.
+      env: {
+        ...process.env,
+        NK_DISABLE_KEYRING: '1',
+        PYTHONPATH: PYTHON_REPO,
+        NK_BUNDLES_PER_HOUR: '100000',
+        NK_MAILBOXES_PER_HOUR: '100000',
+        NK_WRITES_PER_MINUTE: '100000',
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
     },
   );

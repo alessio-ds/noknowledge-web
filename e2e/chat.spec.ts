@@ -121,3 +121,33 @@ test('recovers an account from its seed phrase', async ({ browser }) => {
   expect(recoveredCard).toBe(card);
   await context.close();
 });
+
+test('lists the account devices, and a recovered device joins them', async ({ browser }) => {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const mnemonic = await createAccount(page, 'Erin');
+
+  // A fresh account has exactly one device: this browser.
+  await page.getByTestId('my-devices').click();
+  await expect(page.getByTestId('device-list')).toBeVisible({ timeout: 45_000 });
+  await expect(page.getByTestId('device-list').locator('li')).toHaveCount(1);
+  await page.getByLabel('Close dialog').click();
+
+  // Restoring the seed phrase in a second browser profile adds a device, and the
+  // account's list grows to two without either side doing anything else.
+  const second = await browser.newContext();
+  const other = await second.newPage();
+  await other.goto('/');
+  await other.getByRole('button', { name: 'Import from a seed phrase' }).click();
+  await other.getByPlaceholder('Alice').fill('Erin');
+  await other.locator('textarea').first().fill(mnemonic);
+  await other.locator('input[type="password"]').first().fill(PASSWORD);
+  await other.getByRole('button', { name: 'Import' }).click();
+  await expect(other.getByTestId('my-card')).toBeVisible({ timeout: 90_000 });
+
+  await other.getByTestId('my-devices').click();
+  await expect(other.getByTestId('device-list').locator('li')).toHaveCount(2, { timeout: 45_000 });
+
+  await second.close();
+  await context.close();
+});

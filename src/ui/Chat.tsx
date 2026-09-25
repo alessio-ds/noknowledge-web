@@ -3,6 +3,7 @@ import jsQR from 'jsqr';
 import { Client } from '../core/client';
 import { deleteAccount, type UnlockedAccount } from '../core/accountService';
 import { getRelays, setRelays } from '../core/config';
+import type { DeviceEntry } from '../core/devices';
 import type { Contact, Message } from '../core/store';
 import { CopyButton, ErrorText, Modal, QrCode, Spinner } from './components';
 
@@ -42,6 +43,8 @@ export function Chat({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showCard, setShowCard] = useState(false);
+  const [showDevices, setShowDevices] = useState(false);
+  const [devices, setDevices] = useState<DeviceEntry[]>([]);
   const [showAdd, setShowAdd] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [cardText, setCardText] = useState('');
@@ -212,6 +215,17 @@ export function Chat({
     }
   };
 
+  const openDevices = async () => {
+    setShowDevices(true);
+    setDevices([]);
+    setError(null);
+    try {
+      setDevices(await client.devices());
+    } catch (caught) {
+      setError((caught as Error).message);
+    }
+  };
+
   const openCard = async () => {
     setShowCard(true);
     setCardText('');
@@ -369,6 +383,13 @@ export function Chat({
           <div className="row" style={{ marginTop: 10 }}>
             <button className="secondary small" data-testid="my-card" onClick={openCard}>
               My card
+            </button>
+            <button
+              className="secondary small"
+              data-testid="my-devices"
+              onClick={() => void openDevices()}
+            >
+              Devices
             </button>
             <button
               className="secondary small"
@@ -541,6 +562,32 @@ export function Chat({
             </>
           ) : (
             <Spinner label="Preparing card…" />
+          )}
+          <ErrorText error={error} />
+        </Modal>
+      )}
+
+      {showDevices && (
+        <Modal title="My devices" onClose={() => setShowDevices(false)}>
+          <p className="small muted">
+            Every device on this account gets its own encrypted copy of anything sent to you.
+            Restoring your seed phrase in another browser adds it here — with no history from
+            before it joined.
+          </p>
+          {devices.length === 0 ? (
+            <Spinner label="Asking the relay…" />
+          ) : (
+            <ul className="device-list" data-testid="device-list">
+              {devices.map((device) => (
+                <li key={device.deviceId}>
+                  <div className="name">{device.name || 'unnamed device'}</div>
+                  <div className="small muted mono">{device.deviceId}</div>
+                  <div className="small muted">
+                    mailbox {device.inbox.id.slice(0, 12)}… → {device.relays.join(', ') || 'these relays'}
+                  </div>
+                </li>
+              ))}
+            </ul>
           )}
           <ErrorText error={error} />
         </Modal>

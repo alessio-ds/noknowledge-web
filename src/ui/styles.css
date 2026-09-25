@@ -113,6 +113,10 @@ a { color: var(--accent); }
 
 .qr { border-radius: 12px; background: #fff; padding: 8px; display: block; margin: 0 auto; }
 .card-string { font-family: ui-monospace, Menlo, monospace; font-size: 12px; word-break: break-all; }
+.mono { font-family: ui-monospace, Menlo, monospace; word-break: break-all; }
+.device-list { list-style: none; margin: 12px 0 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.device-list li { border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
+.device-list .name { font-weight: 600; margin-bottom: 2px; }
 video { width: 100%; border-radius: 12px; background: #000; }
 
 .spinner-wrap { display: flex; align-items: center; gap: 10px; color: var(--muted); justify-content: center; padding: 16px; }

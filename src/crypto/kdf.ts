@@ -18,6 +18,11 @@ export const SK_COMMIT_INFO = utf8Encode('nk/sk-commit/v1');
 export const CARD_SIGN_INFO = utf8Encode('nk/card/v1');
 export const SPK_SIGN_INFO = utf8Encode('nk/spk/v1');
 export const AUTH_SIGN_INFO = utf8Encode('nk/auth/v1');
+export const DEVICE_SIGN_INFO = utf8Encode('nk/devices/v1');
+export const DEVICE_LIST_ID_INFO = utf8Encode('nk/devices/v1/id');
+/** Device lists are sealed with a key derived from the account's *public* keys,
+ * so any holder of the contact card can read them but the relay cannot. */
+export const DEVICE_LIST_ENC_INFO = utf8Encode('nk/devices/v1/enc');
 export const ID_HASH_INFO = utf8Encode('nk-id');
 
 /** X25519 domain separation prefix (RFC 7748 / X3DH): 32 bytes of 0xFF. */

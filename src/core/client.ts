@@ -35,6 +35,16 @@ import {
   manifestDict,
 } from './attachments';
 import { CardError, ContactCard } from './card';
+import {
+  DeviceEntry,
+  DeviceList,
+  DeviceListError,
+  LEGACY_DEVICE,
+  deviceListId,
+  newDeviceId,
+  openDeviceList,
+  sealDeviceList,
+} from './devices';
 import { Session } from './session';
 import type { Contact, LocalStore, Message, OutboxEntry } from './store';
 
@@ -63,6 +73,17 @@ export class UnknownContact extends ClientError {
     super(`unknown contact: ${contactId}`);
     this.name = 'UnknownContact';
   }
+}
+
+/** Session state for one contact.
+ *
+ * `outbound` sessions are keyed by the *peer's* device id, `inbound` ones by
+ * *our* device id. They are kept apart on purpose: sharing one map let a receipt
+ * write clobber the very session needed to read the reply. */
+interface ContactState {
+  devices: DeviceEntry[];
+  outbound: Record<string, Session>;
+  inbound: Record<string, Session>;
 }
 
 function nowMs(): number {
@@ -94,6 +115,8 @@ export class Client {
   private ownInbox: MailboxCapability | null = null;
   private bundleId: string | null = null;
   private cardCache: ContactCard | null = null;
+  /** This device's identifier within the account, once provisioned. */
+  private deviceId: string | null = null;
   /** Serializes state-mutating work. The UI long-polls while the user sends;
    * without this, a sync and a send both load and save the same session and the
    * last writer silently destroys ratchet state. */
@@ -191,7 +214,107 @@ export class Client {
       this.relays,
       this.name,
     );
+    await this.ensureDeviceRegistered();
     return this.cardCache;
+  }
+
+  // -- devices ----------------------------------------------------------
+
+  /** This device's id within the account, once provisioned. */
+  async thisDeviceId(): Promise<string> {
+    await this.provisionInner();
+    return this.deviceId as string;
+  }
+
+  private deviceEntry(): DeviceEntry {
+    if (!this.ownInbox || !this.bundleId) throw new NotProvisioned();
+    return new DeviceEntry(
+      this.deviceId ?? LEGACY_DEVICE,
+      { id: this.ownInbox.mailboxId, w: this.ownInbox.writeToken },
+      [...this.relays],
+      this.bundleId,
+      this.name ?? '',
+    );
+  }
+
+  get deviceListAddress(): string {
+    return deviceListId(this.identity.edPublicBytes, this.identity.xPublicBytes);
+  }
+
+  /** Add (or refresh) this device in the account's signed device list.
+   *
+   * This is what makes a recovered account work: the device gets its own mailbox
+   * and prekeys, then publishes itself so senders start delivering a copy here
+   * too. */
+  private async ensureDeviceRegistered(): Promise<void> {
+    if (this.deviceId === null) {
+      this.deviceId =
+        (await this.store.getState(this.identityId, 'device_id')) ?? newDeviceId();
+      await this.store.setState(this.identityId, 'device_id', this.deviceId);
+    }
+    const entry = this.deviceEntry();
+    const existing = await this.fetchOwnDeviceList();
+    const alreadyAdvertised = (existing?.devices ?? []).some(
+      (device) =>
+        device.deviceId === entry.deviceId &&
+        device.inbox.id === entry.inbox.id &&
+        device.inbox.w === entry.inbox.w &&
+        device.bundleId === entry.bundleId &&
+        device.relays.join('\n') === entry.relays.join('\n'),
+    );
+    if (alreadyAdvertised) {
+      // Already advertised exactly like this: republishing would only burn a
+      // relay's prekey quota and churn the record.
+      return;
+    }
+    const entries = (existing?.devices ?? []).filter(
+      (device) => device.deviceId !== entry.deviceId,
+    );
+    entries.push(entry);
+    const listing = DeviceList.create(this.identity, entries);
+    try {
+      await this.backend.publishBundle(listing.address(), sealDeviceList(listing));
+    } catch {
+      // A relay refusing the record must not break provisioning; senders simply
+      // fall back to the inbox in our contact card.
+    }
+  }
+
+  private async fetchOwnDeviceList(): Promise<DeviceList | null> {
+    let payload: unknown;
+    try {
+      payload = await this.backend.fetchBundle(this.deviceListAddress);
+    } catch {
+      return null;
+    }
+    let listing: DeviceList;
+    try {
+      listing = openDeviceList(
+        payload as any,
+        this.identity.edPublicBytes,
+        this.identity.xPublicBytes,
+      );
+    } catch (error) {
+      if (error instanceof DeviceListError) return null;
+      return null;
+    }
+    if (
+      !listing.belongsTo(
+        this.identityId,
+        this.identity.edPublicBytes,
+        this.identity.xPublicBytes,
+      )
+    ) {
+      return null;
+    }
+    return listing;
+  }
+
+  /** Every device currently registered to this account. */
+  async devices(): Promise<DeviceEntry[]> {
+    await this.provisionInner();
+    const listing = await this.fetchOwnDeviceList();
+    return listing ? listing.devices : [this.deviceEntry()];
   }
 
   private generatePrekeys(count: number): Record<string, unknown> {
@@ -284,29 +407,120 @@ export class Client {
   }
 
   // -- sessions ---------------------------------------------------------
+  //
+  // A contact may have several devices, each with its own mailbox and its own
+  // Double Ratchet session, so sessions are keyed by device id. The stored blob
+  // is either the v2 container below or a bare v1 session, read as the legacy
+  // device so existing contacts keep working.
 
-  private loadSession(contact: Contact): Session | null {
-    return contact.session ? Session.fromDict(contact.session) : null;
+  private loadState(contact: Contact): ContactState {
+    const raw = contact.session as any;
+    if (raw && raw.v === 2) {
+      const devices: DeviceEntry[] = [];
+      for (const data of raw.devices ?? []) {
+        try {
+          devices.push(DeviceEntry.fromDict(data));
+        } catch {
+          continue;
+        }
+      }
+      const parse = (bucket: any): Record<string, Session> => {
+        const out: Record<string, Session> = {};
+        for (const [key, value] of Object.entries(bucket ?? {})) {
+          out[key] = Session.fromDict(value);
+        }
+        return out;
+      };
+      return { devices, outbound: parse(raw.outbound), inbound: parse(raw.inbound) };
+    }
+    if (raw) {
+      // v1 blob: a single session, always an outbound one.
+      return { devices: [], outbound: { [LEGACY_DEVICE]: Session.fromDict(raw) }, inbound: {} };
+    }
+    return { devices: [], outbound: {}, inbound: {} };
   }
 
-  private async saveSession(contactId: string, session: Session): Promise<void> {
-    await this.store.setContactSession(this.identityId, contactId, session.toDict());
+  private toStoredState(state: ContactState): Record<string, unknown> {
+    return {
+      v: 2,
+      devices: state.devices.map((device) => device.toDict()),
+      outbound: Object.fromEntries(
+        Object.entries(state.outbound).map(([key, session]) => [key, session.toDict()]),
+      ),
+      inbound: Object.fromEntries(
+        Object.entries(state.inbound).map(([key, session]) => [key, session.toDict()]),
+      ),
+    };
   }
 
-  private async findSession(sid: Uint8Array): Promise<[Contact | null, Session | null]> {
-    for (const contact of await this.store.listContacts(this.identityId)) {
-      if (contact.session) {
-        const session = Session.fromDict(contact.session);
-        if (equalBytes(session.sid, sid)) return [contact, session];
+  private async saveState(contactId: string, state: ContactState): Promise<void> {
+    await this.store.setContactSession(this.identityId, contactId, this.toStoredState(state));
+  }
+
+  private cachedDevices(contact: Contact): DeviceEntry[] {
+    const devices = this.loadState(contact).devices;
+    return devices.length > 0 ? devices : [this.legacyDevice(contact)];
+  }
+
+  /** The single inbox advertised in a contact card, pre-device-lists. */
+  private legacyDevice(contact: Contact): DeviceEntry {
+    return new DeviceEntry(
+      LEGACY_DEVICE,
+      { id: contact.inbox.id, w: contact.inbox.w },
+      [...(contact.relays ?? [])],
+      contact.bundle_id,
+      contact.nickname ?? '',
+    );
+  }
+
+  /** Locate a session by its wire id across every contact and bucket. */
+  private async findSession(
+    sid: Uint8Array,
+  ): Promise<
+    [Contact | null, ContactState | null, 'outbound' | 'inbound' | null, string | null, Session | null]
+  > {
+    const contacts = await this.store.listContacts(this.identityId);
+    for (const contact of contacts) {
+      const state = this.loadState(contact);
+      for (const bucket of ['outbound', 'inbound'] as const) {
+        for (const [key, session] of Object.entries(state[bucket])) {
+          if (equalBytes(session.sid, sid)) return [contact, state, bucket, key, session];
+        }
       }
     }
-    return [null, null];
+    return [null, null, null, null, null];
   }
 
-  private async fetchBundle(contact: Contact): Promise<PrekeyBundle> {
+  private async fetchPeerDeviceList(contact: Contact): Promise<DeviceList | null> {
+    const address = deviceListId(b64d(contact.isign), b64d(contact.idh));
     let payload: unknown;
     try {
-      payload = await this.backendFor(contact.relays).fetchBundle(contact.bundle_id);
+      payload = await this.backendFor(contact.relays).fetchBundle(address);
+    } catch {
+      return null;
+    }
+    let listing: DeviceList;
+    try {
+      listing = openDeviceList(payload as any, b64d(contact.isign), b64d(contact.idh));
+    } catch (error) {
+      if (error instanceof DeviceListError) return null;
+      return null;
+    }
+    if (!listing.belongsTo(contact.id, b64d(contact.isign), b64d(contact.idh))) return null;
+    return listing;
+  }
+
+  /** The peer's devices, freshly fetched, else the last known set. */
+  private async peerDevices(contact: Contact): Promise<DeviceEntry[]> {
+    const listing = await this.fetchPeerDeviceList(contact);
+    if (listing) return listing.devices;
+    return this.cachedDevices(contact);
+  }
+
+  private async fetchDeviceBundle(contact: Contact, device: DeviceEntry): Promise<PrekeyBundle> {
+    let payload: unknown;
+    try {
+      payload = await this.backendFor(device.relays).fetchBundle(device.bundleId);
     } catch (error) {
       throw new ClientError(`could not fetch prekey bundle: ${String(error)}`);
     }
@@ -317,26 +531,40 @@ export class Client {
     }
   }
 
-  private async ensureOutboundSession(contact: Contact): Promise<Session> {
-    const existing = this.loadSession(contact);
-    if (existing) return existing;
-    const bundle = await this.fetchBundle(contact);
+  private async startSession(contact: Contact, device: DeviceEntry): Promise<Session> {
+    const bundle = await this.fetchDeviceBundle(contact, device);
     const initiation = x3dhInitiate(bundle, b64d(contact.isign), b64d(contact.idh));
-    const session = new Session(
+    return new Session(
       randomBytes(16),
       Ratchet.initiator(initiation.sk, bundle.spk),
       initiation.sk,
       initDict(initiation),
       false,
     );
-    await this.saveSession(contact.id, session);
-    return session;
+  }
+
+  /** One outbound session per device of the peer, creating any missing. */
+  private async ensureOutboundSessions(
+    contact: Contact,
+    state: ContactState,
+  ): Promise<DeviceEntry[]> {
+    const devices = await this.peerDevices(contact);
+    const targets = devices.length > 0 ? devices : [this.legacyDevice(contact)];
+    for (const device of targets) {
+      if (!state.outbound[device.deviceId]) {
+        state.outbound[device.deviceId] = await this.startSession(contact, device);
+      }
+    }
+    // Sessions for devices the peer no longer advertises are kept, not deleted:
+    // a stale list must never destroy history.
+    return targets;
   }
 
   // -- sending ----------------------------------------------------------
 
-  private recipientCapability(contact: Contact): MailboxCapability {
-    return MailboxCapability.fromCardView(contact.inbox);
+  /** The write capability for one device's mailbox. */
+  private deviceCapability(device: DeviceEntry): MailboxCapability {
+    return MailboxCapability.fromCardView(device.inbox);
   }
 
   /** A backend that can reach a peer, using the relays from *their* card. */
@@ -355,6 +583,7 @@ export class Client {
 
   private async sendEnvelope(
     contact: Contact,
+    device: DeviceEntry,
     session: Session,
     envelope: Record<string, unknown>,
     kind: string,
@@ -369,8 +598,28 @@ export class Client {
       outgoing.card = (await this.cardInner()).signedDict();
     }
     const blob = seal(session.ratchet, outgoing, session.sid, init, envelopeMaxSize(kind));
-    await this.backendFor(contact.relays).put(this.recipientCapability(contact), blob);
+    await this.backendFor(device.relays).put(this.deviceCapability(device), blob);
     return blob;
+  }
+
+  /** Deliver one copy per device, sealed with that device's own session.
+   *
+   * `envelopeFor(device)` builds the plaintext for one device, so a file
+   * transfer can carry that device's own chunk ids. */
+  private async fanOut(
+    contact: Contact,
+    devices: DeviceEntry[],
+    sessions: Record<string, Session>,
+    envelopeFor: (device: DeviceEntry) => Record<string, unknown>,
+    kind: string,
+  ): Promise<Array<[DeviceEntry, Uint8Array]>> {
+    const results: Array<[DeviceEntry, Uint8Array]> = [];
+    for (const device of devices) {
+      const session = sessions[device.deviceId];
+      const blob = await this.sendEnvelope(contact, device, session, envelopeFor(device), kind);
+      results.push([device, blob]);
+    }
+    return results;
   }
 
   sendText(contactId: string, text: string): Promise<string> {
@@ -380,11 +629,13 @@ export class Client {
   private async sendTextInner(contactId: string, text: string): Promise<string> {
     await this.provisionInner();
     const contact = await this.requireContact(contactId);
-    const session = await this.ensureOutboundSession(contact);
+    const state = this.loadState(contact);
+    const devices = await this.ensureOutboundSessions(contact, state);
+    state.devices = devices;
     const messageId = newId();
     const envelope = makeEnvelope('text', { text }, messageId, nowMs());
-    const blob = await this.sendEnvelope(contact, session, envelope, 'text');
-    await this.saveSession(contactId, session);
+    const blobs = await this.fanOut(contact, devices, state.outbound, () => envelope, 'text');
+    await this.saveState(contactId, state);
     await this.store.addMessage({
       id: messageId,
       identity_id: this.identityId,
@@ -397,7 +648,9 @@ export class Client {
       state: 'sent',
       meta: null,
     });
-    await this.queueOutbox(contact, messageId, blob);
+    for (const [device, blob] of blobs) {
+      await this.queueOutbox(contact, device, messageId, blob);
+    }
     return messageId;
   }
 
@@ -420,50 +673,68 @@ export class Client {
   ): Promise<string> {
     await this.provisionInner();
     const contact = await this.requireContact(contactId);
-    const session = await this.ensureOutboundSession(contact);
+    const state = this.loadState(contact);
+    const devices = await this.ensureOutboundSessions(contact, state);
+    state.devices = devices;
     const attachment = encryptAttachment(data);
-    const capability = this.recipientCapability(contact);
-    const backend = this.backendFor(contact.relays);
-    const chunkIds: string[] = [];
-    for (const chunk of attachment.chunks) {
-      chunkIds.push(await backend.putBlob(capability, chunk.ciphertext));
+
+    // Each device's mailbox needs its own chunk ids, so the manifest is built
+    // per device and travels inside that device's copy of the message.
+    const bodies: Record<string, Record<string, unknown>> = {};
+    for (const device of devices) {
+      const backend = this.backendFor(device.relays);
+      const capability = this.deviceCapability(device);
+      const chunkIds: string[] = [];
+      for (const chunk of attachment.chunks) {
+        chunkIds.push(await backend.putBlob(capability, chunk.ciphertext));
+      }
+      const manifest = manifestDict(attachment, chunkIds);
+      manifest.name = filename;
+      manifest.mime = mime;
+      bodies[device.deviceId] = { caption, attachment: manifest };
     }
-    const manifest = manifestDict(attachment, chunkIds);
-    manifest.name = filename;
-    manifest.mime = mime;
 
     const messageId = newId();
-    const body = { caption, attachment: manifest };
-    const envelope = makeEnvelope('file', body, messageId, nowMs());
-    const blob = await this.sendEnvelope(contact, session, envelope, 'file');
-    await this.saveSession(contactId, session);
+    const blobs = await this.fanOut(
+      contact,
+      devices,
+      state.outbound,
+      (device) => makeEnvelope('file', bodies[device.deviceId], messageId, nowMs()),
+      'file',
+    );
+    await this.saveState(contactId, state);
     await this.store.addMessage({
       id: messageId,
       identity_id: this.identityId,
       contact_id: contactId,
       direction: 'sent',
       type: 'file',
-      body,
+      body: bodies[devices[0].deviceId],
       remote_id: null,
       ts: nowMs(),
       state: 'sent',
       meta: null,
     });
-    await this.queueOutbox(contact, messageId, blob);
+    for (const [device, blob] of blobs) {
+      await this.queueOutbox(contact, device, messageId, blob);
+    }
     return messageId;
   }
 
   private async queueOutbox(
     contact: Contact,
+    device: DeviceEntry,
     messageId: string,
     blob: Uint8Array,
   ): Promise<void> {
     const entry: OutboxEntry = {
-      id: messageId,
+      // One row per device copy. The message id is the prefix, so the receipt
+      // for a message clears every device's row.
+      id: `${messageId}:${device.deviceId}`,
       identity_id: this.identityId,
       contact_id: contact.id,
-      mailbox_id: contact.inbox.id,
-      relay: null,
+      mailbox_id: device.inbox.id,
+      relay: device.relays.join(','),
       payload: b64e(blob),
       seq: 1, // already accepted by at least one relay
       created_at: nowMs() / 1000,
@@ -478,9 +749,13 @@ export class Client {
       if (entry.seq) continue;
       const contact = await this.store.getContact(this.identityId, entry.contact_id);
       if (!contact) continue;
+      const device = this.cachedDevices(contact).find(
+        (candidate) => candidate.inbox.id === entry.mailbox_id,
+      );
+      if (!device) continue;
       try {
-        await this.backendFor(contact.relays).put(
-          this.recipientCapability(contact),
+        await this.backendFor(device.relays).put(
+          this.deviceCapability(device),
           b64d(entry.payload),
         );
         await this.store.outboxMarkSent(entry.id);
@@ -514,7 +789,7 @@ export class Client {
     for (const item of [...fetched].sort((a, b) => a.seq - b.seq)) {
       if (blocked.has(item.relay)) continue;
       try {
-        const message = await this.handleBlob(capability, item.blob);
+        const message = await this.handleBlob(item.blob);
         if (message) newMessages.push(message);
         ackable[item.relay] = Math.max(ackable[item.relay] ?? 0, item.seq);
         this.retryCounts.delete(`${item.relay}:${item.seq}`);
@@ -537,13 +812,10 @@ export class Client {
     return newMessages;
   }
 
-  private async handleBlob(
-    ownCapability: MailboxCapability,
-    blob: Uint8Array,
-  ): Promise<Message | null> {
+  private async handleBlob(blob: Uint8Array): Promise<Message | null> {
     const wire = parseWire(blob);
     const sid = b64d(String(wire.sid));
-    let [contact, session] = await this.findSession(sid);
+    let [contact, state, bucket, key, session] = await this.findSession(sid);
 
     let fresh = false;
     let pendingOpk: number | null = null;
@@ -567,16 +839,22 @@ export class Client {
     if (fresh) {
       contact = await this.finishInbound(session, envelope, pendingOpk);
       if (!contact) return null;
-    } else {
-      if (!contact) return null;
-      if (!session.established) {
-        session.established = true;
-        session.sk = null;
-      }
+      // The peer addressed our own inbox directly, so this session belongs to
+      // this device.
+      state = this.loadState(contact);
+      bucket = 'inbound';
+      key = this.deviceId ?? LEGACY_DEVICE;
+    } else if (!session.established) {
+      session.established = true;
+      session.sk = null;
     }
 
-    await this.saveSession(contact.id, session);
-    return this.processEnvelope(contact, session, envelope, ownCapability);
+    if (!contact || !state || !bucket || !key) {
+      return null;
+    }
+    state[bucket][key] = session;
+    await this.saveState(contact.id, state);
+    return this.processEnvelope(contact, envelope);
   }
 
   private async beginInbound(wire: any): Promise<[Session, number | null] | null> {
@@ -631,11 +909,10 @@ export class Client {
     if (card.identityId !== auth.id) return null;
     if (!equalBytes(card.isign, b64d(String(auth.isign)))) return null;
 
-    const contact = await this.storeCard(card, null, session.toDict());
+    const contact = await this.storeCard(card, null, null);
     await this.consumeOpk(opkId);
     session.established = true;
     session.sk = null;
-    await this.saveSession(contact.id, session);
     return contact;
   }
 
@@ -651,9 +928,7 @@ export class Client {
 
   private async processEnvelope(
     contact: Contact,
-    session: Session,
     envelope: Record<string, unknown>,
-    ownCapability: MailboxCapability,
   ): Promise<Message | null> {
     const kind = envelope.type as string | undefined;
     const envelopeId = envelope.id as string | undefined;
@@ -676,7 +951,7 @@ export class Client {
         meta: null,
       };
       await this.store.addMessage(message);
-      await this.sendReceipt(contact, session, envelopeId, 'delivered');
+      await this.sendReceipt(contact, envelopeId, 'delivered');
       return this.store.getMessage(message.id);
     }
 
@@ -685,7 +960,8 @@ export class Client {
       if (target) {
         const state = (body.kind as string) || 'read';
         await this.store.updateMessage(target, { state });
-        await this.store.outboxRemove(target);
+        // One row per device copy, all prefixed by the message id.
+        await this.store.outboxRemoveForMessage(target);
       }
       return null;
     }
@@ -693,15 +969,21 @@ export class Client {
     return null;
   }
 
-  private async sendReceipt(
-    contact: Contact,
-    session: Session,
-    ofId: string,
-    kind = 'delivered',
-  ): Promise<void> {
+  /** Tell every device of the peer that we opened its copy of a message. */
+  private async sendReceipt(contact: Contact, ofId: string, kind = 'delivered'): Promise<void> {
     const envelope = makeEnvelope('receipt', { of: ofId, kind }, newId(), nowMs());
-    await this.sendEnvelope(contact, session, envelope, 'receipt');
-    await this.saveSession(contact.id, session);
+    try {
+      // Re-read: the caller's contact may predate a session saved moments ago (a
+      // stale row would rewrite the store and drop that session).
+      const fresh = (await this.store.getContact(this.identityId, contact.id)) ?? contact;
+      const state = this.loadState(fresh);
+      const devices = await this.ensureOutboundSessions(fresh, state);
+      state.devices = devices;
+      await this.fanOut(fresh, devices, state.outbound, () => envelope, 'receipt');
+      await this.saveState(fresh.id, state);
+    } catch {
+      // A receipt is best effort: never let it fail the message it acks.
+    }
   }
 
   markRead(contactId: string, messageId: string): Promise<void> {
@@ -710,12 +992,12 @@ export class Client {
 
   private async markReadInner(contactId: string, messageId: string): Promise<void> {
     const contact = await this.requireContact(contactId);
-    const session = this.loadSession(contact);
-    if (!session) throw new ClientError('no session with this contact');
     const message = await this.store.getMessage(messageId);
     if (!message) throw new ClientError(`unknown message: ${messageId}`);
+    // The peer knows this message by *its* envelope id, which we recorded as
+    // remote_id; referencing our local id would be meaningless to them.
     const target = message.remote_id || messageId;
-    await this.sendReceipt(contact, session, target, 'read');
+    await this.sendReceipt(contact, target, 'read');
   }
 
   // -- reading ----------------------------------------------------------

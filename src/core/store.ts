@@ -60,9 +60,13 @@ export class LocalStore {
     private readonly db: IDBPDatabase,
     readonly key: Uint8Array,
     readonly identityId: string,
+    /** Distinguishes two stores for the *same* identity in one browser.
+     * A real device is a browser profile, so this is empty there; tests and
+     * advanced setups use it to keep a second device's records apart. */
+    private readonly namespace = '',
   ) {}
 
-  static async open(key: Uint8Array, identityId: string): Promise<LocalStore> {
+  static async open(key: Uint8Array, identityId: string, namespace = ''): Promise<LocalStore> {
     if (key.length !== LOCAL_KEY_SIZE) throw new Error('local store key must be 32 bytes');
     const db = await openDB(DB_NAME, DB_VERSION, {
       upgrade(database) {
@@ -71,25 +75,29 @@ export class LocalStore {
         }
       },
     });
-    return new LocalStore(db, key, identityId);
+    return new LocalStore(db, key, identityId, namespace);
   }
 
   /** Drop every record for this identity (used by "delete account"). */
   async destroy(): Promise<void> {
     const keys = await this.db.getAllKeys(STORE);
-    const prefix = `${this.identityId}:`;
+    const prefix = `${this.identityId}${this.scopeSuffix}:`;
     await Promise.all(
       keys
         .map((key) => String(key))
-        .filter((key) => key.includes(prefix) || key.endsWith(`:${this.identityId}`))
+        .filter((key) => key.includes(prefix) || key.endsWith(`:${this.identityId}${this.scopeSuffix}`))
         .map((key) => this.db.delete(STORE, key)),
     );
   }
 
   // -- plumbing ---------------------------------------------------------
 
+  private get scopeSuffix(): string {
+    return this.namespace ? `#${this.namespace}` : '';
+  }
+
   private recordKey(kind: string, id: string): string {
-    return `${kind}:${this.identityId}:${id}`;
+    return `${kind}:${this.identityId}${this.scopeSuffix}:${id}`;
   }
 
   private seal(value: unknown): string {
@@ -117,7 +125,7 @@ export class LocalStore {
   }
 
   private async list(kind: string): Promise<any[]> {
-    const prefix = `${kind}:${this.identityId}:`;
+    const prefix = `${kind}:${this.identityId}${this.scopeSuffix}:`;
     const records = await this.db.getAll(STORE);
     return records
       .filter((record: any) => String(record.k).startsWith(prefix))
@@ -217,6 +225,17 @@ export class LocalStore {
 
   async outboxRemove(entryId: string): Promise<void> {
     await this.delete('outbox', entryId);
+  }
+
+  /** Clear every per-device row for one message (ids are `msg:device`). */
+  async outboxRemoveForMessage(messageId: string): Promise<void> {
+    const prefix = `${messageId}:`;
+    const entries = await this.list('outbox');
+    await Promise.all(
+      entries
+        .filter((entry) => entry.id === messageId || String(entry.id).startsWith(prefix))
+        .map((entry) => this.delete('outbox', entry.id)),
+    );
   }
 
   async outboxMarkSent(entryId: string): Promise<void> {
