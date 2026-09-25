@@ -55,7 +55,7 @@ describe('TypeScript client <-> Python reference client', () => {
       expect(inbound.some((m) => (m.body as any).text === 'hello from python')).toBe(true);
 
       // 4. Web -> Python attachment.
-      const webPayload = randomBytes(5000);
+      const webPayload = randomBytes(200_000);
       await web.sendFile(peerId, webPayload, 'from-web.bin', 'application/octet-stream');
       const pythonFiles = await peer.send({ cmd: 'sync', wait: 0 });
       const pythonFile = pythonFiles.messages.find((m: any) => m.type === 'file');
@@ -66,7 +66,7 @@ describe('TypeScript client <-> Python reference client', () => {
       // 5. Python -> web attachment, decrypted by the browser code.
       const dir = mkdtempSync(path.join(tmpdir(), 'nk-file-'));
       const filePath = path.join(dir, 'from-python.bin');
-      const pythonPayload = randomBytes(9000);
+      const pythonPayload = randomBytes(300_000);
       writeFileSync(filePath, pythonPayload);
       await peer.send({ cmd: 'send_file', contact: web.identityId, path: filePath });
       await web.sync(0);

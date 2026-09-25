@@ -11,7 +11,11 @@ import { toHex } from '../crypto/bytes';
 import { b64d, b64e } from '../crypto/encoding';
 import { randomBytes } from '../crypto/random';
 
-export const CHUNK_SIZE = 256 * 1024;
+// Smaller than the Python client's 256 KiB on purpose: on a slow relay link a
+// 256 KiB request can exceed any sane timeout, and many small chunks make
+// progress visible. The manifest carries per-chunk nonces, so the chunk size is
+// a sender-side choice and stays interoperable with the Python client.
+export const CHUNK_SIZE = 64 * 1024;
 export const KEY_SIZE = 32;
 export const MAX_FILE_SIZE = 25 * 1024 * 1024;
 

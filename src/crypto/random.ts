@@ -13,7 +13,12 @@ function assertCrypto(): Crypto {
 
 export function randomBytes(length: number): Uint8Array {
   const out = new Uint8Array(length);
-  assertCrypto().getRandomValues(out);
+  const crypto = assertCrypto();
+  // getRandomValues rejects any single request larger than 65536 bytes, so fill
+  // in slices; large callers (tests, future bulk key material) then just work.
+  for (let offset = 0; offset < length; offset += 65536) {
+    crypto.getRandomValues(out.subarray(offset, Math.min(offset + 65536, length)));
+  }
   return out;
 }
 

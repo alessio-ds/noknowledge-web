@@ -48,6 +48,7 @@ export function Chat({
   const [addText, setAddText] = useState('');
   const [relaysText, setRelaysText] = useState(getRelays().join('\n'));
   const [scanning, setScanning] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState<{ id: string; done: number; total: number } | null>(null);
 
   const fileRef = useRef<HTMLInputElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -189,8 +190,11 @@ export function Chat({
 
   const download = async (message: Message) => {
     setError(null);
+    setDownloadProgress({ id: message.id, done: 0, total: 0 });
     try {
-      const data = await client.downloadAttachment(message);
+      const data = await client.downloadAttachment(message, (done, total) =>
+        setDownloadProgress({ id: message.id, done, total }),
+      );
       const attachment = ((message.body as any)?.attachment ?? {}) as Record<string, unknown>;
       const blob = new Blob([data as unknown as BlobPart], {
         type: (attachment.mime as string) || 'application/octet-stream',
@@ -203,6 +207,8 @@ export function Chat({
       URL.revokeObjectURL(url);
     } catch (caught) {
       setError((caught as Error).message);
+    } finally {
+      setDownloadProgress(null);
     }
   };
 
@@ -270,10 +276,10 @@ export function Chat({
     }
   };
 
-  const scanFrame = () => {
+  const scanFrame = useCallback(() => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
-    if (!video || !canvas || video.readyState !== video.HAVE_ENOUGH_DATA) {
+    if (!video || !canvas || video.readyState !== video.HAVE_ENOUGH_DATA || video.videoWidth === 0) {
       rafRef.current = requestAnimationFrame(scanFrame);
       return;
     }
@@ -290,26 +296,54 @@ export function Chat({
       return;
     }
     rafRef.current = requestAnimationFrame(scanFrame);
-  };
+  }, [stopScan]);
+
+  // The <video> only exists once the modal has rendered, so attach the stream
+  // here rather than in the click handler. Doing it from the handler with a 0ms
+  // timeout was why iOS Safari and Samsung Internet showed a black preview: the
+  // ref was still null, so srcObject was never set.
+  useEffect(() => {
+    if (!scanning) return;
+    const video = videoRef.current;
+    const stream = streamRef.current;
+    if (!video || !stream) return;
+    video.muted = true;
+    video.setAttribute('playsinline', 'true');
+    video.setAttribute('autoplay', 'true');
+    video.srcObject = stream;
+    const begin = () => {
+      if (rafRef.current === null) rafRef.current = requestAnimationFrame(scanFrame);
+    };
+    const played = video.play();
+    if (played && typeof played.then === 'function') played.then(begin).catch(begin);
+    else begin();
+    return () => {
+      if (rafRef.current !== null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    };
+  }, [scanning, scanFrame]);
 
   const startScan = async () => {
     setError(null);
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError('This browser will not give the page a camera (it must be served over HTTPS). Paste the card instead.');
+      return;
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment' },
+        video: {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
       });
       streamRef.current = stream;
       setScanning(true);
-      setTimeout(() => {
-        const video = videoRef.current;
-        if (!video) return;
-        video.srcObject = stream;
-        void video.play().then(() => {
-          rafRef.current = requestAnimationFrame(scanFrame);
-        });
-      }, 0);
     } catch (caught) {
-      setError(`Camera unavailable: ${(caught as Error).message}`);
+      const reason = (caught as Error)?.name === 'NotAllowedError' ? 'permission denied' : (caught as Error).message;
+      setError(`Camera unavailable: ${reason}. Paste the card instead.`);
     }
   };
 
@@ -419,9 +453,14 @@ export function Chat({
                             <button
                               className="secondary small"
                               data-testid="download"
+                              disabled={downloadProgress?.id === message.id}
                               onClick={() => void download(message)}
                             >
-                              Download
+                              {downloadProgress?.id === message.id
+                                ? downloadProgress.total > 0
+                                  ? `Downloading ${downloadProgress.done}/${downloadProgress.total}`
+                                  : 'Downloading…'
+                                : 'Download'}
                             </button>
                           )}
                         </div>
@@ -537,7 +576,13 @@ export function Chat({
               </button>
             )}
           </div>
-          {scanning && <video ref={videoRef} playsInline muted style={{ marginTop: 12 }} />}
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted
+            style={{ marginTop: 12, display: scanning ? 'block' : 'none' }}
+          />
           <canvas ref={canvasRef} style={{ display: 'none' }} />
           <ErrorText error={error} />
         </Modal>

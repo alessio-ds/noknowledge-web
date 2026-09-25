@@ -724,15 +724,21 @@ export class Client {
     return this.store.listMessages(this.identityId, contactId);
   }
 
-  async downloadAttachment(message: Message): Promise<Uint8Array> {
+  async downloadAttachment(
+    message: Message,
+    onProgress?: (done: number, total: number) => void,
+  ): Promise<Uint8Array> {
     await this.provision();
     const manifest = (message.body as any)?.attachment;
     if (!manifest) throw new AttachmentError('message has no attachment');
     const decoded = decodeManifest(manifest);
     const capability = this.ownInbox as MailboxCapability;
     const ciphertexts: Uint8Array[] = [];
+    const total = decoded.chunkIds.length;
+    onProgress?.(0, total);
     for (const chunkId of decoded.chunkIds) {
       ciphertexts.push(await this.backend.getBlob(capability, chunkId));
+      onProgress?.(ciphertexts.length, total);
     }
     return decryptAttachment(decoded.key, decoded.nonces, ciphertexts, decoded.sha256);
   }

@@ -116,6 +116,10 @@ export class HttpRelayBackend {
         'X-NK-Chunk': chunkId,
       },
       body: chunk,
+      // Chunks are large and relays can be slow; a 30s timeout would turn a
+      // slow link into a hard failure. One attempt, generous deadline.
+      timeoutMs: 180_000,
+      retries: 1,
     });
     return String((await response.json()).chunk_id);
   }
@@ -127,6 +131,8 @@ export class HttpRelayBackend {
         'X-NK-Read': capability.readToken,
         'X-NK-Mailbox': capability.mailboxId,
       },
+      timeoutMs: 180_000,
+      retries: 1,
     });
     return new Uint8Array(await response.arrayBuffer());
   }

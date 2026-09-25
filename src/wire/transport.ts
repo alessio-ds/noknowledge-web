@@ -18,6 +18,10 @@ export interface RequestOptions {
   json?: unknown;
   query?: Record<string, string | number>;
   signal?: AbortSignal;
+  /** Override the transport timeout (e.g. large attachments on a slow link). */
+  timeoutMs?: number;
+  /** Override the retry count; blob transfers use a single attempt. */
+  retries?: number;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -49,10 +53,12 @@ export class Transport {
       body = options.body as BodyInit;
     }
 
+    const timeoutMs = options.timeoutMs ?? this.timeoutMs;
+    const attempts = Math.max(1, options.retries ?? this.retries);
     let lastError: unknown = null;
-    for (let attempt = 0; attempt < this.retries; attempt++) {
+    for (let attempt = 0; attempt < attempts; attempt++) {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
       const onAbort = () => controller.abort();
       options.signal?.addEventListener('abort', onAbort, { once: true });
       try {
@@ -66,7 +72,7 @@ export class Transport {
       } catch (error) {
         lastError = error;
         if (options.signal?.aborted) break;
-        if (attempt < this.retries - 1) await sleep(this.backoffMs * 2 ** attempt);
+        if (attempt < attempts - 1) await sleep(this.backoffMs * 2 ** attempt);
       } finally {
         clearTimeout(timer);
         options.signal?.removeEventListener('abort', onAbort);

@@ -63,14 +63,21 @@ describe('browser client against a real relay', () => {
     const bob = await makeClient('bob2', [relay.url]);
     await alice.addContact(await bob.cardString());
 
-    const payload = randomBytes(7000);
+    // Multi-chunk on purpose: 200 KB is four 64 KiB chunks, so this covers
+    // chunking, sequential chunk fetch and progress reporting.
+    const payload = randomBytes(200_000);
     await alice.sendFile(bob.identityId, payload, 'note.bin', 'application/octet-stream');
     await bob.sync(0);
 
     const fileMessage = (await bob.messages(alice.identityId)).find((m) => m.type === 'file');
     expect(fileMessage).toBeTruthy();
-    const downloaded = await bob.downloadAttachment(fileMessage!);
+    const progress: Array<[number, number]> = [];
+    const downloaded = await bob.downloadAttachment(fileMessage!, (done, total) =>
+      progress.push([done, total]),
+    );
     expect(Array.from(downloaded)).toEqual(Array.from(payload));
+    expect(progress[0][1]).toBeGreaterThan(1);
+    expect(progress[progress.length - 1]).toEqual([progress[0][1], progress[0][1]]);
   }, 60_000);
 
   it('does not deliver duplicates when syncing repeatedly', async () => {
