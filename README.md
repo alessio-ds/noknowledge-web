@@ -57,6 +57,8 @@ is wire-compatible with it. Compatibility is enforced by tests, not by hope:
 - `test/interop.e2e.test.ts` runs a TypeScript client against a **live Python
   client** through the same relay: cards, text, receipts and files in both
   directions.
+- `test/concurrency.test.ts` runs a UI-style long-poll loop concurrently with sends and
+  asserts no message is lost — it reproduces a real ratchet-state race and guards the fix.
 - `e2e/chat.spec.ts` drives two real browsers with Playwright: create accounts,
   exchange a message, send a file, download and verify its bytes, sign out and
   unlock, and recover from the seed phrase.

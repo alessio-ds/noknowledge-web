@@ -18,7 +18,7 @@ import { Ratchet } from '../crypto/ratchet';
 import { randomBytes } from '../crypto/random';
 import { buildAuth, initDict, initiate as x3dhInitiate, respond as x3dhRespond, verifyAuth } from '../crypto/x3dh';
 import type { Transport } from '../wire/transport';
-import { MailboxCapability } from '../wire/backends/base';
+import { MailboxCapability, type FetchedMessage } from '../wire/backends/base';
 import { MultiRelayBackend, normalizeRelayUrls } from '../wire/backends/multiRelay';
 import {
   envelopeMaxSize,
@@ -39,6 +39,10 @@ import { Session } from './session';
 import type { Contact, LocalStore, Message, OutboxEntry } from './store';
 
 export const DEFAULT_OPK_COUNT = 20;
+
+/** After this many failed opens, a blob is acknowledged anyway so one poison
+ * message cannot block a mailbox forever. */
+const MAX_DECRYPT_ATTEMPTS = 5;
 
 export class ClientError extends Error {
   constructor(message: string) {
@@ -90,6 +94,11 @@ export class Client {
   private ownInbox: MailboxCapability | null = null;
   private bundleId: string | null = null;
   private cardCache: ContactCard | null = null;
+  /** Serializes state-mutating work. The UI long-polls while the user sends;
+   * without this, a sync and a send both load and save the same session and the
+   * last writer silently destroys ratchet state. */
+  private opChain: Promise<unknown> = Promise.resolve();
+  private readonly retryCounts = new Map<string, number>();
 
   constructor(
     identity: Identity,
@@ -110,6 +119,15 @@ export class Client {
     this.opkCount = opkCount;
   }
 
+  private runExclusive<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.opChain.then(task, task);
+    this.opChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
   // -- provisioning -----------------------------------------------------
 
   get isProvisioned(): boolean {
@@ -117,8 +135,12 @@ export class Client {
   }
 
   /** Ensure the mailbox, prekeys and card exist, then return the card. */
-  async card(): Promise<ContactCard> {
-    await this.provision();
+  card(): Promise<ContactCard> {
+    return this.runExclusive(() => this.cardInner());
+  }
+
+  private async cardInner(): Promise<ContactCard> {
+    await this.provisionInner();
     return this.cardCache as ContactCard;
   }
 
@@ -126,7 +148,11 @@ export class Client {
     return (await this.card()).to_string();
   }
 
-  async provision(): Promise<ContactCard> {
+  provision(): Promise<ContactCard> {
+    return this.runExclusive(() => this.provisionInner());
+  }
+
+  private async provisionInner(): Promise<ContactCard> {
     if (this.cardCache) return this.cardCache;
 
     const inboxJson = await this.store.getState(this.identityId, 'inbox');
@@ -202,7 +228,11 @@ export class Client {
 
   // -- contacts ---------------------------------------------------------
 
-  async addContact(cardString: string, nickname?: string | null): Promise<Contact> {
+  addContact(cardString: string, nickname?: string | null): Promise<Contact> {
+    return this.runExclusive(() => this.addContactInner(cardString, nickname ?? null));
+  }
+
+  private async addContactInner(cardString: string, nickname: string | null): Promise<Contact> {
     let card: ContactCard;
     try {
       card = ContactCard.fromString(cardString);
@@ -213,7 +243,7 @@ export class Client {
     if (card.identityId === this.identityId) {
       throw new ClientError('cannot add your own card as a contact');
     }
-    return this.storeCard(card, nickname ?? null);
+    return this.storeCard(card, nickname);
   }
 
   private async storeCard(
@@ -336,15 +366,19 @@ export class Client {
       init = session.init;
       outgoing = { ...envelope };
       outgoing.auth = buildAuth(this.identity, session.sid, session.init, session.sk);
-      outgoing.card = (await this.card()).signedDict();
+      outgoing.card = (await this.cardInner()).signedDict();
     }
     const blob = seal(session.ratchet, outgoing, session.sid, init, envelopeMaxSize(kind));
     await this.backendFor(contact.relays).put(this.recipientCapability(contact), blob);
     return blob;
   }
 
-  async sendText(contactId: string, text: string): Promise<string> {
-    await this.provision();
+  sendText(contactId: string, text: string): Promise<string> {
+    return this.runExclusive(() => this.sendTextInner(contactId, text));
+  }
+
+  private async sendTextInner(contactId: string, text: string): Promise<string> {
+    await this.provisionInner();
     const contact = await this.requireContact(contactId);
     const session = await this.ensureOutboundSession(contact);
     const messageId = newId();
@@ -367,14 +401,24 @@ export class Client {
     return messageId;
   }
 
-  async sendFile(
+  sendFile(
     contactId: string,
     data: Uint8Array,
     filename: string,
     mime: string,
     caption = '',
   ): Promise<string> {
-    await this.provision();
+    return this.runExclusive(() => this.sendFileInner(contactId, data, filename, mime, caption));
+  }
+
+  private async sendFileInner(
+    contactId: string,
+    data: Uint8Array,
+    filename: string,
+    mime: string,
+    caption: string,
+  ): Promise<string> {
+    await this.provisionInner();
     const contact = await this.requireContact(contactId);
     const session = await this.ensureOutboundSession(contact);
     const attachment = encryptAttachment(data);
@@ -453,19 +497,43 @@ export class Client {
   async sync(wait = 0): Promise<Message[]> {
     await this.provision();
     const capability = this.ownInbox as MailboxCapability;
+    // The long-poll must NOT hold the operation lock, or a user's send would
+    // block for up to `wait` seconds. Only processing is serialized.
     const fetched = await this.backend.fetch(capability, {}, wait);
+    return this.runExclusive(() => this.processFetched(capability, fetched));
+  }
+
+  private async processFetched(
+    capability: MailboxCapability,
+    fetched: FetchedMessage[],
+  ): Promise<Message[]> {
     const newMessages: Message[] = [];
-    const maxSeq: Record<string, number> = {};
-    for (const item of fetched) {
-      maxSeq[item.relay] = Math.max(maxSeq[item.relay] ?? 0, item.seq);
+    const ackable: Record<string, number> = {};
+    const blocked = new Set<string>();
+
+    for (const item of [...fetched].sort((a, b) => a.seq - b.seq)) {
+      if (blocked.has(item.relay)) continue;
       try {
         const message = await this.handleBlob(capability, item.blob);
         if (message) newMessages.push(message);
+        ackable[item.relay] = Math.max(ackable[item.relay] ?? 0, item.seq);
+        this.retryCounts.delete(`${item.relay}:${item.seq}`);
       } catch {
-        /* a single undecodable blob must not stop the batch */
+        const key = `${item.relay}:${item.seq}`;
+        const attempts = (this.retryCounts.get(key) ?? 0) + 1;
+        this.retryCounts.set(key, attempts);
+        if (attempts >= MAX_DECRYPT_ATTEMPTS) {
+          ackable[item.relay] = Math.max(ackable[item.relay] ?? 0, item.seq);
+          this.retryCounts.delete(key);
+        } else {
+          // Acknowledging deletes server-side, so never ack past a blob we could
+          // not open: leave it for the next poll, when state is consistent.
+          blocked.add(item.relay);
+        }
       }
     }
-    if (Object.keys(maxSeq).length > 0) await this.backend.ack(capability, maxSeq);
+
+    if (Object.keys(ackable).length > 0) await this.backend.ack(capability, ackable);
     return newMessages;
   }
 
@@ -490,8 +558,10 @@ export class Client {
     let envelope: Record<string, unknown>;
     try {
       [envelope] = unseal(session.ratchet, blob);
-    } catch {
-      return null;
+    } catch (error) {
+      // A session matched, so this really is ours: propagate so the caller does
+      // not acknowledge (and thereby delete) a message it could not open.
+      throw error;
     }
 
     if (fresh) {
@@ -634,7 +704,11 @@ export class Client {
     await this.saveSession(contact.id, session);
   }
 
-  async markRead(contactId: string, messageId: string): Promise<void> {
+  markRead(contactId: string, messageId: string): Promise<void> {
+    return this.runExclusive(() => this.markReadInner(contactId, messageId));
+  }
+
+  private async markReadInner(contactId: string, messageId: string): Promise<void> {
     const contact = await this.requireContact(contactId);
     const session = this.loadSession(contact);
     if (!session) throw new ClientError('no session with this contact');
