@@ -1,0 +1,32 @@
+# Serve the noknowledge relay and the web client from one origin.
+#
+# The relay keeps owning /api/*; everything else is static files. Because the
+# page and the API share an origin there is no CORS preflight and the client's
+# default relay (its own origin) is already correct.
+#
+# Build the client first:  npm run build   ->  dist/
+# Then copy dist/ to the server, e.g.:
+#   rsync -avz --delete dist/ user@server:/srv/noknowledge-web/
+
+noknowledge.remotewire.net {
+	encode zstd gzip
+
+	# Relay API (mailboxes, prekeys, blobs, health). Long-poll requests can be
+	# held open for up to ~20s by the client; Caddy's proxy has no default
+	# response timeout, so this just works.
+	handle /api/* {
+		reverse_proxy localhost:9999
+	}
+
+	# The static web client.
+	handle {
+		root * /srv/noknowledge-web
+		try_files {path} /index.html
+		file_server
+	}
+
+	# Vite emits content-hashed asset filenames, so they are safe to cache
+	# forever. index.html is left uncached so deploys are picked up immediately.
+	@assets path /assets/*
+	header @assets Cache-Control "public, max-age=31536000, immutable"
+}

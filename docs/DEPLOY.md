@@ -1,45 +1,69 @@
 # Deploying noknowledge-web
 
-`noknowledge-web` is a static site. Serving it is the easy part; the only real
-decision is how your users' browsers will reach a relay.
+`noknowledge-web` is a **static site**. Serving it needs no Node process and no
+extra port: any web server can hand out the files in `dist/`. The only decision
+is how the browser reaches a relay.
 
-## Option A — serve the app from the relay (recommended, no CORS)
+## Recommended — same origin as the relay (Caddy)
 
-Put the relay behind a reverse proxy that serves `dist/` for everything except
-`/api`, which it forwards to the relay. The page and the API share an origin, so
-no CORS headers or preflights are involved.
+Run the relay and the web client behind one hostname. The client's default relay
+is its own origin, so there is nothing to configure and no CORS preflight.
 
-Minimal nginx sketch:
+Example for a relay already reverse-proxied on `localhost:9999`:
 
-```nginx
-server {
-    listen 443 ssl;
-    server_name chat.example;
+```caddyfile
+noknowledge.remotewire.net {
+	encode zstd gzip
 
-    root /srv/noknowledge-web/dist;
-    index index.html;
+	# The relay keeps owning /api/*.
+	handle /api/* {
+		reverse_proxy localhost:9999
+	}
 
-    location / {
-        try_files $uri /index.html;
-    }
+	# Everything else is the static web client.
+	handle {
+		root * /srv/noknowledge-web
+		try_files {path} /index.html
+		file_server
+	}
 
-    location /api/ {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_read_timeout 75s;   # covers long-poll `wait`
-    }
+	# Vite emits content-hashed asset names; index.html stays uncached.
+	@assets path /assets/*
+	header @assets Cache-Control "public, max-age=31536000, immutable"
 }
 ```
 
-The default relay is the app's own origin, so no configuration is needed.
+Deploy:
+
+```bash
+# 1. Build the client (on your machine or in CI)
+npm run build
+
+# 2. Copy the static output to the server
+rsync -avz --delete dist/ user@server:/srv/noknowledge-web/
+
+# 3. Reload Caddy
+sudo systemctl reload caddy     # or: caddy reload --config /etc/caddy/Caddyfile
+```
+
+Then open `https://noknowledge.remotewire.net`.
+
+Notes:
+
+- `handle /api/*` must come **before** the general `handle` block; Caddy's
+  `handle` directives are mutually exclusive and matched in order.
+- No new port is opened. Caddy itself serves the files; the relay stays on 9999.
+- Long-poll requests are held up to ~20 s by the client. Caddy's reverse proxy
+  has no default response timeout, so `/api/*` works as-is.
+- To deploy from the repo without copying, point `root *` at
+  `/path/to/noknowledge-web/dist` instead.
 
 ## Option B — static host + separate relay (CORS required)
 
 If you host `dist/` on GitHub Pages, Netlify, S3, etc. and point users at a relay
-on another origin, the relay must send CORS headers. The relay uses custom
-request headers (`X-NK-Read`, `X-NK-Write`, `X-NK-Mailbox`, `X-NK-Chunk`), so
-every call is preflighted.
+on another origin, the relay must send CORS headers. The client sends custom
+headers (`X-NK-Read`, `X-NK-Write`, `X-NK-Mailbox`, `X-NK-Chunk`), so every call
+is preflighted.
 
 Add to the FastAPI app (`noknowledge/server/app.py`):
 
@@ -62,21 +86,28 @@ app.add_middleware(
 )
 ```
 
-Notes:
+Then pin the relay at build time, because the app's own origin is no longer the
+relay:
+
+```bash
+VITE_DEFAULT_RELAYS="https://noknowledge.remotewire.net" npm run build
+```
+
+An alternative that avoids CORS entirely: have Caddy add the headers itself with
+`header` directives, or put a tiny reverse proxy in front of the relay that
+injects them. Notes:
 
 - Do **not** enable `allow_credentials`; the client uses header tokens, not
   cookies.
 - An explicit origin list is preferred. `allow_origins=["*"]` also works because
   authorization is by capability token rather than origin, but it lets any site
   use your relay as a store-and-forward service.
-- Pin the app's relay with `VITE_DEFAULT_RELAYS="https://relay.example"` at build
-  time, or have users set it under **Settings**.
-- If users self-host relays, they can enter their own URLs in Settings.
+- Users can also set their own relays under **Settings**.
 
 ## Notes
 
-- The app is built with `base: './'`, so it works from a subpath.
-- `npm run build` output is `dist/`; no server-side rendering or Node runtime is
-  required.
-- Long-poll requests hold a connection up to 20 s in the UI; size your proxy timeouts
-  accordingly.
+- The app is built with `base: './'`, so it works from a subpath
+  (e.g. `https://example.com/chat/`) without rebuilding.
+- `dist/` is fully static; no server-side rendering or Node runtime is required.
+- If you want a preview server locally, `npm run preview` listens on
+  `127.0.0.1:4173` and proxies `/api` to `NK_RELAY` (default `http://127.0.0.1:8000`).
