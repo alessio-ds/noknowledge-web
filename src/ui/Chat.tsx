@@ -1,0 +1,571 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import jsQR from 'jsqr';
+import { Client } from '../core/client';
+import { deleteAccount, type UnlockedAccount } from '../core/accountService';
+import { getRelays, setRelays } from '../core/config';
+import type { Contact, Message } from '../core/store';
+import { CopyButton, ErrorText, Modal, QrCode, Spinner } from './components';
+
+type Status = 'connecting' | 'online' | 'offline';
+
+function formatTime(ms: number): string {
+  return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function stateMark(state: string | null): string {
+  if (state === 'read' || state === 'delivered') return '✓✓';
+  return '✓';
+}
+
+export function Chat({
+  session,
+  onLock,
+  onSessionChange,
+}: {
+  session: UnlockedAccount;
+  onLock: () => void;
+  onSessionChange: (account: UnlockedAccount) => void;
+}) {
+  const client = session.client;
+  const [contacts, setContacts] = useState<Contact[]>([]);
+  const [previews, setPreviews] = useState<Record<string, Message | null>>({});
+  const [selected, setSelected] = useState<string | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [text, setText] = useState('');
+  const [status, setStatus] = useState<Status>('connecting');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [showCard, setShowCard] = useState(false);
+  const [showAdd, setShowAdd] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [cardText, setCardText] = useState('');
+  const [addText, setAddText] = useState('');
+  const [relaysText, setRelaysText] = useState(getRelays().join('\n'));
+  const [scanning, setScanning] = useState(false);
+
+  const fileRef = useRef<HTMLInputElement | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const selectedRef = useRef<string | null>(null);
+  selectedRef.current = selected;
+
+  const refreshContacts = useCallback(async () => {
+    const list = await client.listContacts();
+    setContacts(list);
+    const nextPreviews: Record<string, Message | null> = {};
+    for (const contact of list) {
+      const history = await client.messages(contact.id);
+      nextPreviews[contact.id] = history.length > 0 ? history[history.length - 1] : null;
+    }
+    setPreviews(nextPreviews);
+    return list;
+  }, [client]);
+
+  const refreshMessages = useCallback(
+    async (contactId: string) => {
+      const list = await client.messages(contactId);
+      setMessages(list);
+      return list;
+    },
+    [client],
+  );
+
+  // Receive loop: long-poll our own mailbox and refresh the view.
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const tick = async () => {
+      if (cancelled) return;
+      try {
+        const news = await client.sync(20);
+        if (cancelled) return;
+        setStatus('online');
+        if (news.length > 0) {
+          await refreshContacts();
+          const current = selectedRef.current;
+          if (current && news.some((message) => message.contact_id === current)) {
+            await refreshMessages(current);
+          }
+        }
+        void client.flushOutbox().catch(() => {});
+      } catch {
+        if (!cancelled) setStatus('offline');
+      }
+      if (!cancelled) timer = setTimeout(tick, 400);
+    };
+
+    void refreshContacts().then(() => tick());
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      client.close();
+    };
+  }, [client, refreshContacts, refreshMessages]);
+
+  // Load the selected conversation and emit read receipts.
+  useEffect(() => {
+    if (!selected) {
+      setMessages([]);
+      return;
+    }
+    let alive = true;
+    void (async () => {
+      const list = await client.messages(selected);
+      if (!alive) return;
+      setMessages(list);
+      let changed = false;
+      for (const message of list) {
+        if (message.direction === 'received' && message.state !== 'read') {
+          try {
+            await client.markRead(selected, message.id);
+            changed = true;
+          } catch {
+            /* receipt is best-effort */
+          }
+        }
+      }
+      if (changed && alive) await refreshMessages(selected);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [selected, client, refreshMessages]);
+
+  const stopScan = useCallback(() => {
+    if (rafRef.current !== null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    setScanning(false);
+  }, []);
+
+  useEffect(() => () => stopScan(), [stopScan]);
+
+  const send = async () => {
+    const body = text.trim();
+    if (!body || !selected) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await client.sendText(selected, body);
+      setText('');
+      await refreshMessages(selected);
+      await refreshContacts();
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const attach = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file || !selected) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const data = new Uint8Array(await file.arrayBuffer());
+      await client.sendFile(selected, data, file.name, file.type || 'application/octet-stream');
+      await refreshMessages(selected);
+      await refreshContacts();
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const download = async (message: Message) => {
+    setError(null);
+    try {
+      const data = await client.downloadAttachment(message);
+      const attachment = ((message.body as any)?.attachment ?? {}) as Record<string, unknown>;
+      const blob = new Blob([data as unknown as BlobPart], {
+        type: (attachment.mime as string) || 'application/octet-stream',
+      });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = (attachment.name as string) || 'attachment';
+      anchor.click();
+      URL.revokeObjectURL(url);
+    } catch (caught) {
+      setError((caught as Error).message);
+    }
+  };
+
+  const openCard = async () => {
+    setShowCard(true);
+    setCardText('');
+    setError(null);
+    try {
+      setCardText(await client.cardString());
+    } catch (caught) {
+      setError((caught as Error).message);
+    }
+  };
+
+  const submitAdd = async () => {
+    if (!addText.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const contact = await client.addContact(addText.trim());
+      setAddText('');
+      setShowAdd(false);
+      await refreshContacts();
+      setSelected(contact.id);
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveSettings = async () => {
+    const relays = relaysText
+      .split('\n')
+      .map((relay) => relay.trim())
+      .filter(Boolean);
+    if (relays.length === 0) {
+      setError('At least one relay URL is required.');
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      setRelays(relays);
+      const next = new Client(session.identity, session.store, relays, session.meta.label);
+      await next.provision();
+      onSessionChange({ ...session, client: next });
+      setShowSettings(false);
+      setStatus('connecting');
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removeAccount = async () => {
+    const password = window.prompt('Enter your password to delete this account and all local data');
+    if (!password) return;
+    try {
+      await deleteAccount(session.meta, password);
+      onLock();
+    } catch (caught) {
+      window.alert((caught as Error).message);
+    }
+  };
+
+  const scanFrame = () => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas || video.readyState !== video.HAVE_ENOUGH_DATA) {
+      rafRef.current = requestAnimationFrame(scanFrame);
+      return;
+    }
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const context = canvas.getContext('2d');
+    if (!context) return;
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const image = context.getImageData(0, 0, canvas.width, canvas.height);
+    const code = jsQR(image.data, image.width, image.height);
+    if (code?.data) {
+      setAddText(code.data);
+      stopScan();
+      return;
+    }
+    rafRef.current = requestAnimationFrame(scanFrame);
+  };
+
+  const startScan = async () => {
+    setError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment' },
+      });
+      streamRef.current = stream;
+      setScanning(true);
+      setTimeout(() => {
+        const video = videoRef.current;
+        if (!video) return;
+        video.srcObject = stream;
+        void video.play().then(() => {
+          rafRef.current = requestAnimationFrame(scanFrame);
+        });
+      }, 0);
+    } catch (caught) {
+      setError(`Camera unavailable: ${(caught as Error).message}`);
+    }
+  };
+
+  const current = contacts.find((contact) => contact.id === selected) ?? null;
+
+  return (
+    <div className={`app${selected ? '' : ' show-list'}`}>
+      <aside className="sidebar">
+        <div className="sidebar-head">
+          <div className="row between">
+            <div style={{ minWidth: 0 }}>
+              <div className="me" data-testid="self-name">
+                {session.meta.label || 'me'}
+              </div>
+              <div className="id small muted" style={{ fontFamily: 'ui-monospace, Menlo, monospace' }}>
+                {client.identityId}
+              </div>
+            </div>
+            <span className={`badge ${status === 'online' ? 'online' : status === 'offline' ? 'offline' : ''}`}>
+              {status}
+            </span>
+          </div>
+          <div className="row" style={{ marginTop: 10 }}>
+            <button className="secondary small" data-testid="my-card" onClick={openCard}>
+              My card
+            </button>
+            <button
+              className="secondary small"
+              data-testid="open-add"
+              onClick={() => {
+                setShowAdd(true);
+                setError(null);
+              }}
+            >
+              Add contact
+            </button>
+            <button
+              className="ghost small"
+              data-testid="open-settings"
+              onClick={() => {
+                setShowSettings(true);
+                setError(null);
+              }}
+            >
+              Settings
+            </button>
+          </div>
+        </div>
+        <div className="contacts">
+          {contacts.length === 0 && (
+            <p className="small muted" style={{ padding: 14 }}>
+              No contacts yet. Share your card, or add someone else&apos;s.
+            </p>
+          )}
+          {contacts.map((contact) => {
+            const preview = previews[contact.id];
+            const snippet = preview
+              ? preview.type === 'file'
+                ? '📎 attachment'
+                : String((preview.body as any)?.text ?? '')
+              : contact.id.slice(0, 10);
+            return (
+              <div
+                key={contact.id}
+                className={`contact${contact.id === selected ? ' active' : ''}`}
+                data-testid="contact"
+                onClick={() => setSelected(contact.id)}
+              >
+                <div className="name">{contact.nickname || contact.id.slice(0, 8)}</div>
+                <div className="preview">{snippet}</div>
+              </div>
+            );
+          })}
+        </div>
+      </aside>
+
+      <main className="chat">
+        {current ? (
+          <>
+            <div className="chat-head">
+              <div>
+                <div className="me">{current.nickname || current.id.slice(0, 8)}</div>
+                <div className="id small muted" style={{ fontFamily: 'ui-monospace, Menlo, monospace' }}>
+                  {current.id}
+                </div>
+              </div>
+              <button className="ghost small" onClick={() => setSelected(null)}>
+                Close
+              </button>
+            </div>
+            <div className="messages" data-testid="messages">
+              {messages.map((message) => {
+                const sent = message.direction === 'sent';
+                const attachment = ((message.body as any)?.attachment ?? null) as Record<string, unknown> | null;
+                const caption = String((message.body as any)?.caption ?? '');
+                return (
+                  <div key={message.id} className={`bubble${sent ? ' sent' : ''}`} data-testid="bubble">
+                    {message.type === 'file' && attachment ? (
+                      <div>
+                        <div className="attachment">
+                          <span>📎</span>
+                          <div className="grow">
+                            <div>{String(attachment.name ?? 'attachment')}</div>
+                            <div className="small muted">{formatSize(Number(attachment.size ?? 0))}</div>
+                          </div>
+                          {!sent && (
+                            <button
+                              className="secondary small"
+                              data-testid="download"
+                              onClick={() => void download(message)}
+                            >
+                              Download
+                            </button>
+                          )}
+                        </div>
+                        {caption ? (
+                          <div className="text" style={{ marginTop: 6 }}>
+                            {caption}
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : (
+                      <div className="text">{String((message.body as any)?.text ?? '')}</div>
+                    )}
+                    <div className="meta">
+                      <span>{formatTime(message.ts)}</span>
+                      {sent ? <span title={message.state ?? 'sent'}>{stateMark(message.state)}</span> : null}
+                    </div>
+                  </div>
+                );
+              })}
+              {messages.length === 0 && (
+                <div className="empty">
+                  No messages yet. Say hello — the first message carries your contact card.
+                </div>
+              )}
+            </div>
+            <div className="composer">
+              <textarea
+                data-testid="composer"
+                value={text}
+                onChange={(event) => setText(event.target.value)}
+                placeholder="Write a message…"
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault();
+                    void send();
+                  }
+                }}
+              />
+              <input
+                ref={fileRef}
+                data-testid="attach-input"
+                type="file"
+                style={{ display: 'none' }}
+                onChange={(event) => void attach(event)}
+              />
+              <button className="secondary" onClick={() => fileRef.current?.click()} disabled={busy}>
+                Attach
+              </button>
+              <button data-testid="send" onClick={() => void send()} disabled={busy || !text.trim()}>
+                Send
+              </button>
+            </div>
+            <ErrorText error={error} />
+          </>
+        ) : (
+          <div className="empty">
+            <div>
+              <h2>Select a contact</h2>
+              <p className="muted">or add one with a card from someone you trust.</p>
+            </div>
+          </div>
+        )}
+      </main>
+
+      {showCard && (
+        <Modal title="My contact card" onClose={() => setShowCard(false)}>
+          <p className="small muted">
+            Share this with someone you want to talk to. It contains your public keys, a prekey
+            handle, your mailbox write capability, and your relays — nothing secret.
+          </p>
+          {cardText ? (
+            <>
+              <QrCode text={cardText} />
+              <textarea readOnly value={cardText} rows={4} className="card-string" data-testid="card-string" />
+              <div className="row" style={{ marginTop: 10 }}>
+                <CopyButton text={cardText} label="Copy card" />
+              </div>
+            </>
+          ) : (
+            <Spinner label="Preparing card…" />
+          )}
+          <ErrorText error={error} />
+        </Modal>
+      )}
+
+      {showAdd && (
+        <Modal
+          title="Add a contact"
+          onClose={() => {
+            stopScan();
+            setShowAdd(false);
+          }}
+        >
+          <p className="small muted">Paste a card, or scan the QR it came from.</p>
+          <textarea
+            data-testid="add-card"
+            value={addText}
+            onChange={(event) => setAddText(event.target.value)}
+            rows={4}
+            placeholder="nk://1/…"
+          />
+          <div className="row" style={{ marginTop: 10 }}>
+            <button data-testid="submit-add" onClick={() => void submitAdd()} disabled={busy || !addText.trim()}>
+              Add contact
+            </button>
+            {!scanning ? (
+              <button className="secondary" onClick={() => void startScan()}>
+                Scan QR
+              </button>
+            ) : (
+              <button className="secondary" onClick={stopScan}>
+                Stop camera
+              </button>
+            )}
+          </div>
+          {scanning && <video ref={videoRef} playsInline muted style={{ marginTop: 12 }} />}
+          <canvas ref={canvasRef} style={{ display: 'none' }} />
+          <ErrorText error={error} />
+        </Modal>
+      )}
+
+      {showSettings && (
+        <Modal title="Settings" onClose={() => setShowSettings(false)} wide>
+          <label>Relays (one URL per line)</label>
+          <textarea value={relaysText} onChange={(event) => setRelaysText(event.target.value)} rows={4} />
+          <p className="small muted">
+            Writing to all relays replicates your messages; reading uses whichever answers. Changing
+            this re-registers your mailbox and republishes your prekeys.
+          </p>
+          <div className="row" style={{ marginTop: 12 }}>
+            <button onClick={() => void saveSettings()} disabled={busy}>
+              Save relays
+            </button>
+            <button className="ghost" onClick={onLock}>
+              Sign out
+            </button>
+            <span className="grow" />
+            <button className="ghost" onClick={() => void removeAccount()}>
+              Delete account
+            </button>
+          </div>
+          <ErrorText error={error} />
+        </Modal>
+      )}
+    </div>
+  );
+}
