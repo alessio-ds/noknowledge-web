@@ -43,7 +43,14 @@ IndexedDB (encrypted)      hashed capabilities only          IndexedDB (encrypte
   is a device with its own mailbox and its own ratchet sessions. Restoring the
   seed elsewhere adds that browser to your signed device list, and people who
   already have your card start delivering there too — **My devices** shows the
-  list. History is not synced: a new device sees messages sent after it joined.
+  list.
+- **History sync and mirroring, under your control.** What you send from one
+  device appears on your others, and read state follows. A new device receives
+  new messages immediately, but the **past needs approval**: it asks, and one of
+  your existing devices shows the request until a person approves it there. A
+  stolen seed therefore gets future traffic and never your archive. Prefer a file
+  instead? Export an encrypted history bundle on one device and import it on the
+  other.
 - **Interoperable with the Python client and relay**, proven by tests (below).
 
 ## Protocol compatibility
@@ -63,6 +70,13 @@ is wire-compatible with it. Compatibility is enforced by tests, not by hope:
   client** through the same relay: cards, text, receipts and files in both
   directions. Because both sides publish and read a sealed device list, this also
   proves the multi-device format is byte-compatible across implementations.
+- `test/history.test.ts` covers the bundle format and the encrypted export file,
+  and the interop suite imports a desktop-written file and writes one the desktop
+  client reads — so a backup moves between the two implementations.
+- `test/sync.e2e.test.ts` and the interop suite cover device sync: back-fill only
+  after a human approves, mirroring in both directions, read state, revocation,
+  truncated transfers, and the stolen-seed property. The interop cases pair a
+  live Python device with a browser device, which is what pins the NKS1 format.
 - `test/devices.test.ts` and `test/devices.e2e.test.ts` cover the device list:
   sealing, tamper and wrong-key rejection, two devices of one account both
   receiving, a device restored from the seed joining and receiving, per-device
@@ -163,7 +177,12 @@ e2e/         Playwright browser tests
 - The device list lives at an address anyone can derive from your public keys and
   is sealed with a key derived from those same keys: a peer holding your card can
   read it, and the relay sees only an opaque box — it cannot group your mailboxes
-  or link them to an identity id.
+  or link them to an identity id. Device sync keys travel in their own sealed,
+  account-signed record for the same reason.
+- Device-to-device transfers are sealed to the receiving device's key with every
+  header field authenticated, and a device sends history or mirrors only to
+  devices a human approved. Holding the seed lets someone read new messages — it
+  is the account — but it does not let them pull the past off your devices.
 - Restoring the seed in the **same** browser profile is the same device: this
   client keys local state by identity id, so it reuses the existing mailbox rather
   than registering a second one.

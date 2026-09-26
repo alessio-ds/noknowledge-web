@@ -1,7 +1,7 @@
 {
   "name": "noknowledge-web",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Browser-only noknowledge client: zero-knowledge, federated, capability-mailbox messenger, no Python at runtime.",
   "license": "MIT",
