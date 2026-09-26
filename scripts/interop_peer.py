@@ -6,7 +6,7 @@ drive a *reference* client against the same relay as the browser client. This
 is a test harness only: the web app never runs Python.
 
 Commands: init, add_contact, send_text, send_file, sync, contacts, messages,
-download, mark_read, quit.
+download, mark_read, export_history, import_history, quit.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import sys
 
 sys.path.insert(0, os.environ.get("NK_PYTHON_REPO", os.getcwd()))
 
+from noknowledge.core import history as history_mod  # noqa: E402
 from noknowledge.core.client import Client  # noqa: E402
 from noknowledge.core.store import LocalStore, resolve_store_key  # noqa: E402
 from noknowledge.crypto.identity import Identity  # noqa: E402
@@ -88,6 +89,21 @@ def handle(request: dict) -> dict:
     if command == "mark_read":
         client.mark_read(request["contact"], request["message_id"])
         return {"ok": True}
+    if command == "export_history":
+        # Written to a file so a large bundle never has to cross the line protocol.
+        data = history_mod.export_history(
+            client,
+            request["passphrase"],
+            budget_bytes=int(request.get("budget_bytes", 100 * 1024 * 1024)),
+        )
+        with open(request["path"], "wb") as handle:
+            handle.write(data)
+        return {"ok": True, "bytes": len(data)}
+    if command == "import_history":
+        with open(request["path"], "rb") as handle:
+            data = handle.read()
+        counts = history_mod.import_history(client, data, request["passphrase"])
+        return {"ok": True, "counts": counts}
     if command == "quit":
         return {"ok": True, "bye": True}
     return {"ok": False, "error": f"unknown command: {command}"}

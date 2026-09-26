@@ -4,6 +4,7 @@ import { Client } from '../core/client';
 import { deleteAccount, type UnlockedAccount } from '../core/accountService';
 import { getRelays, setRelays } from '../core/config';
 import type { DeviceEntry } from '../core/devices';
+import { HistoryError, exportHistory, importHistory } from '../core/history';
 import type { Contact, Message } from '../core/store';
 import { CopyButton, ErrorText, Modal, QrCode, Spinner } from './components';
 
@@ -46,6 +47,11 @@ export function Chat({
   const [showDevices, setShowDevices] = useState(false);
   const [devices, setDevices] = useState<DeviceEntry[]>([]);
   const [thisDevice, setThisDevice] = useState<string | null>(null);
+  const [historyRange, setHistoryRange] = useState('30');
+  const [historyPassphrase, setHistoryPassphrase] = useState('');
+  const [historyStatus, setHistoryStatus] = useState<string | null>(null);
+  const [historyBusy, setHistoryBusy] = useState(false);
+  const [cacheStats, setCacheStats] = useState({ chunks: 0, bytes: 0 });
   const [showAdd, setShowAdd] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [cardText, setCardText] = useState('');
@@ -220,12 +226,70 @@ export function Chat({
     setShowDevices(true);
     setDevices([]);
     setError(null);
+    setHistoryStatus(null);
     try {
-      const [listing, mine] = await Promise.all([client.devices(), client.thisDeviceId()]);
+      const [listing, mine, chunks, bytes] = await Promise.all([
+        client.devices(),
+        client.thisDeviceId(),
+        client.store.localBlobCount(),
+        client.store.localBlobBytes(),
+      ]);
       setDevices(listing);
       setThisDevice(mine);
+      setCacheStats({ chunks, bytes });
     } catch (caught) {
       setError((caught as Error).message);
+    }
+  };
+
+  const historySince = (): number | null => {
+    if (historyRange === 'all') return null;
+    return Date.now() - Number(historyRange) * 24 * 3600 * 1000;
+  };
+
+  const downloadBlob = (data: Uint8Array, filename: string) => {
+    const url = URL.createObjectURL(new Blob([data as unknown as BlobPart]));
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const runExportHistory = async () => {
+    setHistoryBusy(true);
+    setHistoryStatus(null);
+    setError(null);
+    try {
+      const data = await exportHistory(client, historyPassphrase, { sinceMs: historySince() });
+      downloadBlob(data, `noknowledge-history-${new Date().toISOString().slice(0, 10)}.nkx`);
+      setHistoryStatus(`Exported ${Math.round(data.length / 1024)} KB. Keep the passphrase: the file cannot be opened without it.`);
+      setHistoryPassphrase('');
+    } catch (caught) {
+      setError(caught instanceof HistoryError ? caught.message : (caught as Error).message);
+    } finally {
+      setHistoryBusy(false);
+    }
+  };
+
+  const runImportHistory = async (file: File) => {
+    setHistoryBusy(true);
+    setHistoryStatus(null);
+    setError(null);
+    try {
+      const data = new Uint8Array(await file.arrayBuffer());
+      const counts = await importHistory(client, data, historyPassphrase);
+      setHistoryStatus(
+        `Merged ${counts.messages} new message(s), ${counts.contacts} contact(s) and ${counts.chunks} attachment chunk(s).`,
+      );
+      setHistoryPassphrase('');
+      await refreshContacts();
+      const bytes = await client.store.localBlobBytes();
+      setCacheStats({ chunks: await client.store.localBlobCount(), bytes });
+    } catch (caught) {
+      setError(caught instanceof HistoryError ? caught.message : (caught as Error).message);
+    } finally {
+      setHistoryBusy(false);
     }
   };
 
@@ -598,6 +662,64 @@ export function Chat({
                 </li>
               ))}
             </ul>
+          )}
+
+          <h3 className="history-head">History</h3>
+          <p className="small muted">
+            {cacheStats.chunks} attachment chunk(s) cached locally (
+            {(cacheStats.bytes / (1024 * 1024)).toFixed(1)} MB). An export file is encrypted with a
+            passphrase you choose and carries contacts, messages and those attachments; importing
+            merges it here without creating duplicates.
+          </p>
+          <div className="row">
+            <select
+              data-testid="history-range"
+              value={historyRange}
+              onChange={(event) => setHistoryRange(event.target.value)}
+            >
+              <option value="30">Last 30 days</option>
+              <option value="60">Last 60 days</option>
+              <option value="90">Last 90 days</option>
+              <option value="all">Everything</option>
+            </select>
+          </div>
+          <div className="row" style={{ marginTop: 8 }}>
+            <input
+              type="password"
+              data-testid="history-passphrase"
+              placeholder="Passphrase for the file"
+              value={historyPassphrase}
+              onChange={(event) => setHistoryPassphrase(event.target.value)}
+            />
+          </div>
+          <div className="row" style={{ marginTop: 8 }}>
+            <button
+              className="secondary small"
+              data-testid="export-history"
+              disabled={historyBusy || !historyPassphrase}
+              onClick={() => void runExportHistory()}
+            >
+              Export…
+            </button>
+            <label className="secondary small file-button">
+              Import…
+              <input
+                type="file"
+                accept=".nkx,application/octet-stream"
+                data-testid="import-history"
+                disabled={historyBusy || !historyPassphrase}
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  event.target.value = '';
+                  if (file) void runImportHistory(file);
+                }}
+              />
+            </label>
+          </div>
+          {historyStatus && (
+            <p className="small ok" data-testid="history-status">
+              {historyStatus}
+            </p>
           )}
           <ErrorText error={error} />
         </Modal>

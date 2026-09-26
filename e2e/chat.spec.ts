@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { expect, test, type Page } from '@playwright/test';
 
 const PASSWORD = 'correct-horse-battery';
@@ -209,6 +210,36 @@ test('the sidebar actions stay on one line and inside the sidebar', async ({ bro
   // Settings moved out of that row, and still opens the modal.
   await page.getByTestId('open-settings').click();
   await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible();
+
+  await context.close();
+});
+
+test('exports history to a file and imports it back', async ({ browser }) => {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  await createAccount(page, 'Grace');
+
+  // A conversation to export: write to ourselves is not possible, so just make
+  // sure the export path produces a file and reports it.
+  await page.getByTestId('my-devices').click();
+  await expect(page.getByTestId('device-list')).toBeVisible({ timeout: 45_000 });
+  await page.getByTestId('history-passphrase').fill('export-passphrase');
+  await page.getByTestId('history-range').selectOption('all');
+
+  const download = page.waitForEvent('download');
+  await page.getByTestId('export-history').click();
+  const saved = await download;
+  const path = await saved.path();
+  expect(path).toBeTruthy();
+  const bytes = readFileSync(path!);
+  expect(bytes.subarray(0, 4).toString('utf8')).toBe('NKX1');
+
+  // The same file imports cleanly (nothing new, but no error either).
+  await page.getByTestId('history-passphrase').fill('export-passphrase');
+  await page.getByTestId('import-history').setInputFiles(path!);
+  await expect(page.getByTestId('history-status')).toContainText('Merged 0 new message(s)', {
+    timeout: 45_000,
+  });
 
   await context.close();
 });

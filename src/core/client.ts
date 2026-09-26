@@ -220,6 +220,11 @@ export class Client {
 
   // -- devices ----------------------------------------------------------
 
+  /** This device's id, or null before provisioning (never provisions). */
+  get currentDeviceId(): string | null {
+    return this.deviceId;
+  }
+
   /** This device's id within the account, once provisioned. */
   async thisDeviceId(): Promise<string> {
     await this.provisionInner();
@@ -693,6 +698,16 @@ export class Client {
       manifest.mime = mime;
       bodies[device.deviceId] = { caption, attachment: manifest };
     }
+    // Keep our own copy under the manifest we record locally, so the file stays
+    // downloadable after the relay drops it and can travel with a history
+    // transfer to another device.
+    const localManifest = bodies[devices[0].deviceId].attachment as any;
+    for (let index = 0; index < attachment.chunks.length; index += 1) {
+      await this.store.putLocalBlob(
+        String(localManifest.chunks[index].id),
+        attachment.chunks[index].ciphertext,
+      );
+    }
 
     const messageId = newId();
     const blobs = await this.fanOut(
@@ -1019,7 +1034,12 @@ export class Client {
     const total = decoded.chunkIds.length;
     onProgress?.(0, total);
     for (const chunkId of decoded.chunkIds) {
-      ciphertexts.push(await this.backend.getBlob(capability, chunkId));
+      let ciphertext = await this.store.getLocalBlob(chunkId);
+      if (ciphertext === null) {
+        ciphertext = await this.backend.getBlob(capability, chunkId);
+        await this.store.putLocalBlob(chunkId, ciphertext);
+      }
+      ciphertexts.push(ciphertext);
       onProgress?.(ciphertexts.length, total);
     }
     return decryptAttachment(decoded.key, decoded.nonces, ciphertexts, decoded.sha256);

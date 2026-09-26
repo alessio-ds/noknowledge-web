@@ -1,11 +1,12 @@
 import 'fake-indexeddb/auto';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Client } from '../src/core/client';
 import { LocalStore } from '../src/core/store';
 import { Identity } from '../src/crypto/identity';
+import { exportHistory, importHistory } from '../src/core/history';
 import { randomBytes } from '../src/crypto/random';
 import { PythonPeer, startRelay, type RelayHandle } from './helpers';
 
@@ -89,6 +90,82 @@ describe('TypeScript client <-> Python reference client', () => {
       await web.sync(0);
       const updated = (await web.messages(peerId)).find((m) => m.id === webSent!.id);
       expect(updated?.state).toBe('read');
+    } finally {
+      await peer.stop();
+    }
+  }, 120_000);
+});
+
+describe('history files across implementations', () => {
+  async function webClientWithHistory(name: string): Promise<{ client: Client; contactId: string }> {
+    const identity = Identity.generate(name)[0];
+    const store = await LocalStore.open(randomBytes(32), identity.identityId, `interop-${name}`);
+    const client = new Client(identity, store, [relay.url], name, undefined, undefined, 5);
+    await client.provision();
+    return { client, contactId: '' };
+  }
+
+  it('imports a history file written by the desktop client', async () => {
+    const { peer, card, id: peerId } = await PythonPeer.start({
+      relays: [relay.url],
+      name: 'python-source',
+    });
+    try {
+      // Give the Python side a real conversation with us.
+      const web = await webClientWithHistory('web-target');
+      await web.client.addContact(card);
+      await web.client.sendText(peerId, 'from the web');
+      await peer.send({ cmd: 'sync', wait: 0 });
+
+      const dir = mkdtempSync(path.join(tmpdir(), 'nk-hist-'));
+      const file = path.join(dir, 'from-python.nkx');
+      const exported = await peer.send({
+        cmd: 'export_history',
+        path: file,
+        passphrase: 'shared-passphrase',
+      });
+      expect(exported.ok).toBe(true);
+
+      // The browser reads a file the desktop client wrote.
+      const data = new Uint8Array(readFileSync(file));
+      const counts = await importHistory(web.client, data, 'shared-passphrase');
+
+      expect(counts.messages).toBeGreaterThanOrEqual(1);
+      expect(counts.contacts).toBeGreaterThanOrEqual(1);
+      const messages = await web.client.messages(peerId);
+      expect(messages.some((m) => (m.body as any)?.text === 'from the web')).toBe(true);
+    } finally {
+      await peer.stop();
+    }
+  }, 120_000);
+
+  it('writes a history file the desktop client can import', async () => {
+    const web = await webClientWithHistory('web-source');
+    const { peer, id: peerId } = await PythonPeer.start({
+      relays: [relay.url],
+      name: 'python-target',
+    });
+    try {
+      await peer.send({ cmd: 'add_contact', card: await web.client.cardString() });
+      await peer.send({ cmd: 'send_text', contact: web.client.identityId, text: 'from python' });
+      const inbound = await web.client.sync(0);
+      expect(inbound).toHaveLength(1);
+
+      const dir = mkdtempSync(path.join(tmpdir(), 'nk-hist-'));
+      const file = path.join(dir, 'from-web.nkx');
+      writeFileSync(file, await exportHistory(web.client, 'shared-passphrase'));
+
+      const imported = await peer.send({
+        cmd: 'import_history',
+        path: file,
+        passphrase: 'shared-passphrase',
+      });
+
+      expect(imported.ok).toBe(true);
+      expect(imported.counts.messages).toBe(1);
+      const stored = await peer.send({ cmd: 'messages', contact: web.client.identityId });
+      expect(stored.messages.map((m: any) => m.body?.text)).toContain('from python');
+      expect(peerId).toBeTruthy();
     } finally {
       await peer.stop();
     }

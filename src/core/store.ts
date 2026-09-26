@@ -14,8 +14,13 @@ import { randomBytes } from '../crypto/random';
 
 export const LOCAL_KEY_SIZE = 32;
 const DB_NAME = 'noknowledge-web';
-const DB_VERSION = 1;
+// v2 added the `blobs` store for the local attachment cache.
+const DB_VERSION = 2;
 const STORE = 'records';
+const BLOB_STORE = 'blobs';
+
+/** Attachment ciphertext kept locally before the oldest entries are dropped. */
+export const LOCAL_BLOB_CAP_BYTES = 1024 * 1024 * 1024;
 
 export interface Contact {
   id: string;
@@ -73,6 +78,9 @@ export class LocalStore {
         if (!database.objectStoreNames.contains(STORE)) {
           database.createObjectStore(STORE, { keyPath: 'k' });
         }
+        if (!database.objectStoreNames.contains(BLOB_STORE)) {
+          database.createObjectStore(BLOB_STORE, { keyPath: 'k' });
+        }
       },
     });
     return new LocalStore(db, key, identityId, namespace);
@@ -80,13 +88,24 @@ export class LocalStore {
 
   /** Drop every record for this identity (used by "delete account"). */
   async destroy(): Promise<void> {
-    const keys = await this.db.getAllKeys(STORE);
     const prefix = `${this.identityId}${this.scopeSuffix}:`;
+    const matches = (key: unknown) => {
+      const text = String(key);
+      return text.includes(prefix) || text.endsWith(`:${this.identityId}${this.scopeSuffix}`);
+    };
+    const keys = await this.db.getAllKeys(STORE);
     await Promise.all(
       keys
         .map((key) => String(key))
-        .filter((key) => key.includes(prefix) || key.endsWith(`:${this.identityId}${this.scopeSuffix}`))
+        .filter(matches)
         .map((key) => this.db.delete(STORE, key)),
+    );
+    const blobKeys = await this.db.getAllKeys(BLOB_STORE);
+    await Promise.all(
+      blobKeys
+        .map((key) => String(key))
+        .filter(matches)
+        .map((key) => this.db.delete(BLOB_STORE, key)),
     );
   }
 
@@ -194,6 +213,15 @@ export class LocalStore {
     );
   }
 
+  /** Every message for this identity, across contacts.
+   *
+   * History collection must not depend on a contact row existing: a bundle that
+   * silently dropped messages would be worse than useless. */
+  async listAllMessages(identityId: string): Promise<Message[]> {
+    const messages = await this.list('message');
+    return messages.sort((a, b) => a.ts - b.ts);
+  }
+
   async updateMessage(messageId: string, fields: Partial<Message>): Promise<void> {
     const message = await this.getMessage(messageId);
     if (!message) return;
@@ -247,6 +275,73 @@ export class LocalStore {
 
   async outboxCount(identityId: string): Promise<number> {
     return (await this.list('outbox')).length;
+  }
+
+  // -- local attachment cache -------------------------------------------
+  //
+  // Attachment ciphertext is already AEAD-sealed for its recipient, so unlike
+  // the records above it needs no second layer: storing the bytes as they are
+  // keeps a file downloadable after relay expiry and lets it travel with a
+  // history transfer.
+
+  private blobKey(chunkId: string): string {
+    return `${this.identityId}${this.scopeSuffix}:${chunkId}`;
+  }
+
+  async putLocalBlob(chunkId: string, ciphertext: Uint8Array): Promise<void> {
+    const existing = await this.db.get(BLOB_STORE, this.blobKey(chunkId));
+    if (!existing) {
+      await this.db.put(BLOB_STORE, {
+        k: this.blobKey(chunkId),
+        v: ciphertext,
+        size: ciphertext.length,
+        created_at: Date.now(),
+      });
+    }
+    await this.pruneLocalBlobs();
+  }
+
+  async getLocalBlob(chunkId: string): Promise<Uint8Array | null> {
+    const record = await this.db.get(BLOB_STORE, this.blobKey(chunkId));
+    return record ? new Uint8Array(record.v) : null;
+  }
+
+  async hasLocalBlob(chunkId: string): Promise<boolean> {
+    const record = await this.db.get(BLOB_STORE, this.blobKey(chunkId));
+    return Boolean(record);
+  }
+
+  private async localBlobRecords(): Promise<any[]> {
+    const prefix = `${this.identityId}${this.scopeSuffix}:`;
+    const records = await this.db.getAll(BLOB_STORE);
+    return records.filter((record: any) => String(record.k).startsWith(prefix));
+  }
+
+  async localBlobCount(): Promise<number> {
+    return (await this.localBlobRecords()).length;
+  }
+
+  async localBlobBytes(): Promise<number> {
+    return (await this.localBlobRecords()).reduce(
+      (total, record) => total + Number(record.size ?? 0),
+      0,
+    );
+  }
+
+  /** Drop the oldest cached chunks until the cache fits `cap`. */
+  async pruneLocalBlobs(cap = LOCAL_BLOB_CAP_BYTES): Promise<number> {
+    const records = await this.localBlobRecords();
+    let total = records.reduce((sum, record) => sum + Number(record.size ?? 0), 0);
+    if (total <= cap) return 0;
+    records.sort((a, b) => Number(a.created_at) - Number(b.created_at));
+    let dropped = 0;
+    for (const record of records) {
+      if (total <= cap) break;
+      await this.db.delete(BLOB_STORE, record.k);
+      total -= Number(record.size ?? 0);
+      dropped += 1;
+    }
+    return dropped;
   }
 
   // -- cursors ----------------------------------------------------------
