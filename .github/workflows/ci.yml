@@ -16,6 +16,6 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build
-      # Vector tests replay Python-generated fixtures and need no interpreter,
-      # and the device-list tests are pure crypto + format checks.
-      - run: npx vitest run test/crypto.test.ts test/devices.test.ts
+      # These replay Python-generated fixtures or check pure formats and crypto,
+      # so they need no interpreter and no relay.
+      - run: npx vitest run test/crypto.test.ts test/devices.test.ts test/history.test.ts
