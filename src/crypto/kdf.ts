@@ -23,6 +23,13 @@ export const DEVICE_LIST_ID_INFO = utf8Encode('nk/devices/v1/id');
 /** Device lists are sealed with a key derived from the account's *public* keys,
  * so any holder of the contact card can read them but the relay cannot. */
 export const DEVICE_LIST_ENC_INFO = utf8Encode('nk/devices/v1/enc');
+/** Per-device sync keys live in their own record, so the device list format
+ * stays unchanged and older clients keep parsing it. */
+export const DEVICE_KEYS_ID_INFO = utf8Encode('nk/devices/v1/keys');
+export const DEVICE_KEYS_SIGN_INFO = utf8Encode('nk/devices/v1/keys/sig');
+/** Device-to-device transfer: everything is derived from one ECIES secret. */
+export const DEVICE_SYNC_INFO = utf8Encode('nk/devices/v1/sync');
+export const DEVICE_SYNC_ITEM_INFO = utf8Encode('nk/devices/v1/sync/item');
 export const ID_HASH_INFO = utf8Encode('nk-id');
 
 /** X25519 domain separation prefix (RFC 7748 / X3DH): 32 bytes of 0xFF. */

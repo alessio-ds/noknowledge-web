@@ -5,6 +5,7 @@ import { deleteAccount, type UnlockedAccount } from '../core/accountService';
 import { getRelays, setRelays } from '../core/config';
 import type { DeviceEntry } from '../core/devices';
 import { HistoryError, exportHistory, importHistory } from '../core/history';
+import type { SyncRequest, SyncStatus } from '../core/sync';
 import type { Contact, Message } from '../core/store';
 import { CopyButton, ErrorText, Modal, QrCode, Spinner } from './components';
 
@@ -18,6 +19,12 @@ function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function describeSince(since: number): string {
+  if (!since) return 'everything';
+  const days = Math.max(1, Math.round((Date.now() - since) / (24 * 3600 * 1000)));
+  return `the last ${days} day${days === 1 ? '' : 's'}`;
 }
 
 function stateMark(state: string | null): string {
@@ -52,6 +59,10 @@ export function Chat({
   const [historyStatus, setHistoryStatus] = useState<string | null>(null);
   const [historyBusy, setHistoryBusy] = useState(false);
   const [cacheStats, setCacheStats] = useState({ chunks: 0, bytes: 0 });
+  const [syncStates, setSyncStates] = useState<SyncStatus[]>([]);
+  const [syncRequests, setSyncRequests] = useState<SyncRequest[]>([]);
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [syncNote, setSyncNote] = useState<string | null>(null);
   const [showAdd, setShowAdd] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [cardText, setCardText] = useState('');
@@ -227,18 +238,80 @@ export function Chat({
     setDevices([]);
     setError(null);
     setHistoryStatus(null);
+    setSyncNote(null);
     try {
-      const [listing, mine, chunks, bytes] = await Promise.all([
+      const [listing, mine, chunks, bytes, states, requests] = await Promise.all([
         client.devices(),
         client.thisDeviceId(),
         client.store.localBlobCount(),
         client.store.localBlobBytes(),
+        client.syncStatus(),
+        client.historyRequests(),
       ]);
       setDevices(listing);
       setThisDevice(mine);
       setCacheStats({ chunks, bytes });
+      setSyncStates(states);
+      setSyncRequests(requests);
     } catch (caught) {
       setError((caught as Error).message);
+    }
+  };
+
+  const runRequestHistory = async () => {
+    setSyncBusy(true);
+    setSyncNote(null);
+    setError(null);
+    try {
+      const asked = await client.requestHistory(historySince());
+      setSyncNote(
+        asked.length > 0
+          ? `Asked ${asked.length} device(s). Approve the request there: that click is what authorises the transfer.`
+          : 'No other device answered yet. Keep this page open and make sure the other device is online.',
+      );
+      await refreshSyncState();
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  const refreshSyncState = async () => {
+    setSyncStates(await client.syncStatus());
+    setSyncRequests(await client.historyRequests());
+  };
+
+  const runApprove = async (deviceId: string) => {
+    setSyncBusy(true);
+    setSyncNote(null);
+    setError(null);
+    try {
+      const result = await client.approveHistory(deviceId);
+      setSyncNote(
+        `Sent ${result.items} item(s) to that device` +
+          (result.skipped ? ` (${result.skipped} attachment(s) were over budget).` : '.') +
+          ' Your future sent messages mirror to it too.',
+      );
+      await refreshSyncState();
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  const runDeny = async (deviceId: string) => {
+    setSyncBusy(true);
+    setError(null);
+    try {
+      await client.denyHistory(deviceId);
+      await refreshSyncState();
+      setSyncNote('Request denied. Nothing was sent.');
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setSyncBusy(false);
     }
   };
 
@@ -649,19 +722,72 @@ export function Chat({
             <Spinner label="Asking the relay…" />
           ) : (
             <ul className="device-list" data-testid="device-list">
-              {devices.map((device) => (
-                <li key={device.deviceId}>
-                  <div className="name">
-                    {device.name || 'unnamed device'}
-                    {device.deviceId === thisDevice && <span className="muted"> · this device</span>}
-                  </div>
-                  <div className="small muted mono">{device.deviceId}</div>
-                  <div className="small muted">
-                    mailbox {device.inbox.id.slice(0, 12)}… → {device.relays.join(', ') || 'these relays'}
-                  </div>
-                </li>
-              ))}
+              {devices.map((device) => {
+                const state = syncStates.find((item) => item.device_id === device.deviceId);
+                const notes: string[] = [];
+                if (device.deviceId !== thisDevice) {
+                  if (!state || !state.has_keys) notes.push('no sync keys yet — update that device');
+                  else if (state.approved) notes.push('history approved');
+                  else notes.push('not approved');
+                  if (state && state.received > 0) {
+                    notes.push(`received ${state.received}/${state.expected || '?'} items`);
+                  }
+                }
+                return (
+                  <li key={device.deviceId}>
+                    <div className="name">
+                      {device.name || 'unnamed device'}
+                      {device.deviceId === thisDevice && <span className="muted"> · this device</span>}
+                    </div>
+                    <div className="small muted mono">{device.deviceId}</div>
+                    {notes.length > 0 && <div className="small muted">{notes.join(' · ')}</div>}
+                    <div className="small muted">
+                      mailbox {device.inbox.id.slice(0, 12)}… → {device.relays.join(', ') || 'these relays'}
+                    </div>
+                  </li>
+                );
+              })}
             </ul>
+          )}
+
+          {syncRequests.length > 0 && (
+            <>
+              <h3 className="history-head">Waiting for your approval</h3>
+              <ul className="device-list" data-testid="sync-requests">
+                {syncRequests.map((request) => (
+                  <li key={request.device_id}>
+                    <div className="name">
+                      {request.name || 'unnamed device'}
+                      <span className="small muted">
+                        {' '}
+                        asked for {describeSince(request.since)}
+                      </span>
+                    </div>
+                    <div className="row" style={{ marginTop: 6 }}>
+                      <button
+                        className="small"
+                        data-testid={`approve-${request.device_id}`}
+                        disabled={syncBusy}
+                        onClick={() => void runApprove(request.device_id)}
+                      >
+                        Approve
+                      </button>
+                      <button
+                        className="secondary small"
+                        disabled={syncBusy}
+                        onClick={() => void runDeny(request.device_id)}
+                      >
+                        Deny
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+              <p className="small muted">
+                Approving sends that device the history it asked for, and mirrors your future sent
+                messages to it. A stolen seed phrase cannot do this on its own: it needs a click here.
+              </p>
+            </>
           )}
 
           <h3 className="history-head">History</h3>
@@ -695,6 +821,14 @@ export function Chat({
           <div className="row" style={{ marginTop: 8 }}>
             <button
               className="secondary small"
+              data-testid="request-history"
+              disabled={syncBusy || devices.length < 2}
+              onClick={() => void runRequestHistory()}
+            >
+              Request history…
+            </button>
+            <button
+              className="secondary small"
               data-testid="export-history"
               disabled={historyBusy || !historyPassphrase}
               onClick={() => void runExportHistory()}
@@ -719,6 +853,11 @@ export function Chat({
           {historyStatus && (
             <p className="small ok" data-testid="history-status">
               {historyStatus}
+            </p>
+          )}
+          {syncNote && (
+            <p className="small ok" data-testid="sync-note">
+              {syncNote}
             </p>
           )}
           <ErrorText error={error} />

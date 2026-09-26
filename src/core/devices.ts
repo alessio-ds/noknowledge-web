@@ -21,10 +21,12 @@
  * account's mailboxes together or link the record to an identity id. */
 
 import { decrypt, encrypt, AEADError } from '../crypto/aead';
-import { concat } from '../crypto/bytes';
+import { concat, utf8Encode } from '../crypto/bytes';
 import { b64d, b64e, canonicalJsonBytes } from '../crypto/encoding';
 import { Identity, computeIdentityId } from '../crypto/identity';
 import {
+  DEVICE_KEYS_ID_INFO,
+  DEVICE_KEYS_SIGN_INFO,
   DEVICE_LIST_ENC_INFO,
   DEVICE_LIST_ID_INFO,
   DEVICE_SIGN_INFO,
@@ -56,6 +58,20 @@ export function deviceListId(edPublic: Uint8Array, xPublic: Uint8Array): string 
 
 export function newDeviceId(): string {
   return b64e(randomBytes(DEVICE_ID_SIZE));
+}
+
+/** Address of one device's sync key record.
+ *
+ * Kept out of the device list on purpose: the list's signed payload is rebuilt
+ * from its own fields, so adding a field would break verification for older
+ * clients and drop them back to single-device delivery. */
+export function deviceKeysId(
+  edPublic: Uint8Array,
+  xPublic: Uint8Array,
+  deviceId: string,
+): string {
+  const digest = sha256(concat(DEVICE_KEYS_ID_INFO, edPublic, xPublic, utf8Encode(deviceId)));
+  return b64e(digest.slice(0, 16));
 }
 
 export interface DeviceInboxView {
@@ -218,6 +234,196 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
+/** One device's own signing and agreement keys, vouched for by the account. */
+export class DeviceKeys {
+  constructor(
+    public deviceId: string,
+    public sdev: Uint8Array,
+    public sagree: Uint8Array,
+    public isign: Uint8Array,
+    public idh: Uint8Array,
+    public account = '',
+    public signature: Uint8Array = new Uint8Array(0),
+    public version: number = DEVICE_LIST_VERSION,
+  ) {}
+
+  address(): string {
+    return deviceKeysId(this.isign, this.idh, this.deviceId);
+  }
+
+  payload(): Record<string, unknown> {
+    return {
+      v: this.version,
+      account: this.account,
+      isign: b64e(this.isign),
+      idh: b64e(this.idh),
+      device: this.deviceId,
+      sdev: b64e(this.sdev),
+      sagree: b64e(this.sagree),
+      bundle_id: this.address(),
+    };
+  }
+
+  private signedBytes(): Uint8Array {
+    return concat(DEVICE_KEYS_SIGN_INFO, canonicalJsonBytes(this.payload()));
+  }
+
+  toBytes(): Uint8Array {
+    const data = this.payload();
+    data.sig = b64e(this.signature);
+    return canonicalJsonBytes(data);
+  }
+
+  static fromBytes(data: Uint8Array | string | Record<string, unknown>): DeviceKeys {
+    let parsed: any = data;
+    if (typeof parsed === 'string' || parsed instanceof Uint8Array) {
+      const text = typeof parsed === 'string' ? parsed : new TextDecoder().decode(parsed);
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        throw new DeviceListError('device keys are not valid JSON');
+      }
+    }
+    if (parsed === null || typeof parsed !== 'object' || parsed.v !== DEVICE_LIST_VERSION) {
+      throw new DeviceListError('unsupported device keys version');
+    }
+    let isign: Uint8Array;
+    let idh: Uint8Array;
+    let sdev: Uint8Array;
+    let sagree: Uint8Array;
+    let signature: Uint8Array;
+    let deviceId: string;
+    let account: string;
+    try {
+      isign = b64d(String(parsed.isign));
+      idh = b64d(String(parsed.idh));
+      deviceId = String(parsed.device);
+      account = String(parsed.account);
+      sdev = b64d(String(parsed.sdev));
+      sagree = b64d(String(parsed.sagree));
+      signature = b64d(String(parsed.sig));
+    } catch {
+      throw new DeviceListError('malformed device keys');
+    }
+    if (sdev.length !== 32 || sagree.length !== 32) {
+      throw new DeviceListError('device keys have the wrong length');
+    }
+    if (computeIdentityId(isign, idh) !== account) {
+      throw new DeviceListError('device keys account does not match its keys');
+    }
+    const record = new DeviceKeys(deviceId, sdev, sagree, isign, idh, account, signature);
+    if (!Identity.verify(isign, signature, record.signedBytes())) {
+      throw new DeviceListError('device keys signature is invalid');
+    }
+    return record;
+  }
+
+  static create(
+    identity: Identity,
+    deviceId: string,
+    sdev: Uint8Array,
+    sagree: Uint8Array,
+  ): DeviceKeys {
+    const record = new DeviceKeys(
+      deviceId,
+      sdev,
+      sagree,
+      identity.edPublicBytes,
+      identity.xPublicBytes,
+      identity.identityId,
+    );
+    record.signature = identity.sign(record.signedBytes());
+    return record;
+  }
+
+  belongsTo(account: string, isign: Uint8Array, idh: Uint8Array): boolean {
+    return (
+      this.account === account && bytesEqual(this.isign, isign) && bytesEqual(this.idh, idh)
+    );
+  }
+}
+
+/** The opaque record to publish on a relay for any account-signed payload. */
+export function sealPayload(
+  isign: Uint8Array,
+  idh: Uint8Array,
+  address: string,
+  plaintext: Uint8Array,
+): Uint8Array {
+  const [nonce, ciphertext] = encrypt(deviceListKey(isign, idh), plaintext);
+  return canonicalJsonBytes({
+    v: DEVICE_LIST_VERSION,
+    bundle_id: address,
+    box: b64e(concat(nonce, ciphertext)),
+  });
+}
+
+/** Open a sealed record fetched from a relay, using the peer's public keys. */
+export function openPayload(
+  data: Uint8Array | string | Record<string, unknown>,
+  isign: Uint8Array,
+  idh: Uint8Array,
+): Uint8Array {
+  let raw: any = data;
+  if (typeof raw === 'string' || raw instanceof Uint8Array) {
+    const text = typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
+    try {
+      raw = JSON.parse(text);
+    } catch {
+      throw new DeviceListError('record is not valid JSON');
+    }
+  }
+  if (raw === null || typeof raw !== 'object' || raw.box === undefined || raw.box === null) {
+    throw new DeviceListError('record is not sealed');
+  }
+  let blob: Uint8Array;
+  try {
+    blob = b64d(String(raw.box));
+  } catch {
+    throw new DeviceListError('record box is not valid base64');
+  }
+  if (blob.length <= 12) throw new DeviceListError('record box is truncated');
+  try {
+    return decrypt(deviceListKey(isign, idh), blob.slice(0, 12), blob.slice(12));
+  } catch (error) {
+    if (error instanceof AEADError) throw new DeviceListError('record could not be opened');
+    throw error;
+  }
+}
+
+/** Open any account-signed record, sealed or (legacy) plain. */
+export function openSignedPayload(
+  data: Uint8Array | string | Record<string, unknown>,
+  isign: Uint8Array,
+  idh: Uint8Array,
+): Record<string, unknown> {
+  if (data !== null && typeof data === 'object' && !(data instanceof Uint8Array)) {
+    const raw = data as Record<string, unknown>;
+    if (raw.box === undefined || raw.box === null) return raw;
+  } else {
+    const text = typeof data === 'string' ? data : new TextDecoder().decode(data as Uint8Array);
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === 'object' && (parsed.box === undefined || parsed.box === null)) {
+        return parsed;
+      }
+    } catch {
+      /* fall through to the sealed path, which reports the real problem */
+    }
+  }
+  const plaintext = openPayload(data, isign, idh);
+  let opened: unknown;
+  try {
+    opened = JSON.parse(new TextDecoder().decode(plaintext));
+  } catch {
+    throw new DeviceListError('record could not be parsed');
+  }
+  if (opened === null || typeof opened !== 'object' || Array.isArray(opened)) {
+    throw new DeviceListError('record is not an object');
+  }
+  return opened as Record<string, unknown>;
+}
+
 // -- sealed storage -------------------------------------------------------
 //
 // The record the relay holds must not tie an identity id to a set of mailboxes.
@@ -231,14 +437,7 @@ export function deviceListKey(isign: Uint8Array, idh: Uint8Array): Uint8Array {
 
 /** The opaque record to publish on a relay. */
 export function sealDeviceList(listing: DeviceList): Uint8Array {
-  const [nonce, ciphertext] = encrypt(deviceListKey(listing.isign, listing.idh), listing.toBytes());
-  return canonicalJsonBytes({
-    v: DEVICE_LIST_VERSION,
-    // The prekey endpoint keys its rows by this field, so it has to stay
-    // visible; it is a public hash of the account keys, nothing more.
-    bundle_id: listing.address(),
-    box: b64e(concat(nonce, ciphertext)),
-  });
+  return sealPayload(listing.isign, listing.idh, listing.address(), listing.toBytes());
 }
 
 /** Open a record fetched from a relay, using the peer's public keys. */

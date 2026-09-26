@@ -243,3 +243,59 @@ test('exports history to a file and imports it back', async ({ browser }) => {
 
   await context.close();
 });
+
+test('a restored device asks for history and the other device approves it', async ({ browser }) => {
+  const first = await browser.newContext();
+  const laptop = await first.newPage();
+  const mnemonic = await createAccount(laptop, 'Heidi');
+
+  // A second device for the same account.
+  const second = await browser.newContext();
+  const phone = await second.newPage();
+  await phone.goto('/');
+  await phone.getByRole('button', { name: 'Import from a seed phrase' }).click();
+  await phone.getByPlaceholder('Alice').fill('Heidi');
+  await phone.locator('textarea').first().fill(mnemonic);
+  await phone.locator('input[type="password"]').first().fill(PASSWORD);
+  await phone.getByRole('button', { name: 'Import' }).click();
+  await expect(phone.getByTestId('my-card')).toBeVisible({ timeout: 90_000 });
+
+  // The new device asks for the past. Nobody has approved it yet.
+  await phone.getByTestId('my-devices').click();
+  await expect(phone.getByTestId('device-list').locator('li')).toHaveCount(2, { timeout: 45_000 });
+  await phone.getByTestId('request-history').click();
+  await expect(phone.getByTestId('sync-note')).toContainText('Approve the request there', {
+    timeout: 45_000,
+  });
+  await phone.getByLabel('Close dialog').click();
+
+  // The laptop sees the request and approves it — the click a stolen seed
+  // cannot make on its own.
+  await expect(async () => {
+    // Close the modal if a previous attempt left it open, then reopen it so the
+    // dialog re-reads the requests from the client.
+    const close = laptop.getByLabel('Close dialog');
+    if ((await close.count()) > 0) await close.first().click();
+    await laptop.getByTestId('my-devices').click();
+    await expect(laptop.getByTestId('sync-requests')).toBeVisible({ timeout: 8_000 });
+  }).toPass({ timeout: 120_000 });
+  await laptop.getByRole('button', { name: 'Approve' }).click();
+  await expect(laptop.getByTestId('sync-note')).toContainText('mirror to it too', {
+    timeout: 45_000,
+  });
+  await laptop.getByLabel('Close dialog').click();
+
+  // The phone now knows it was approved.
+  await expect(async () => {
+    const close = phone.getByLabel('Close dialog');
+    if ((await close.count()) > 0) await close.first().click();
+    await phone.getByTestId('my-devices').click();
+    await expect(phone.getByTestId('device-list')).toContainText('history approved', {
+      timeout: 8_000,
+    });
+    await close.first().click();
+  }).toPass({ timeout: 120_000 });
+
+  await second.close();
+  await first.close();
+});

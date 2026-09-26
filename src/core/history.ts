@@ -32,6 +32,11 @@ export const PBKDF2_ITERATIONS = 600_000;
 
 const STATE_RANK: Record<string, number> = { received: 0, sent: 0, delivered: 1, read: 2 };
 
+/** How far along a message is, so a merge never moves it backwards. */
+export function stateRank(state: unknown): number {
+  return STATE_RANK[String(state)] ?? 0;
+}
+
 export class HistoryError extends Error {
   constructor(message: string) {
     super(message);
@@ -57,13 +62,9 @@ export interface MergeCounts {
   chunks: number;
 }
 
-function stateRank(state: unknown): number {
-  return STATE_RANK[String(state)] ?? 0;
-}
-
 // -- collection ------------------------------------------------------------
 
-function contactItem(contact: Contact): Record<string, unknown> {
+export function contactItem(contact: Contact): Record<string, unknown> {
   return {
     id: contact.id,
     isign: contact.isign,
@@ -77,7 +78,7 @@ function contactItem(contact: Contact): Record<string, unknown> {
   };
 }
 
-function messageItem(message: Message): Record<string, unknown> {
+export function messageItem(message: Message): Record<string, unknown> {
   return {
     contact_id: message.contact_id,
     direction: message.direction,
@@ -226,22 +227,62 @@ async function mergeContact(client: Client, item: Record<string, unknown>): Prom
   return true;
 }
 
-export async function mergeBundle(client: Client, bundle: Bundle): Promise<MergeCounts> {
-  const counts: MergeCounts = { contacts: 0, messages: 0, updates: 0, chunks: 0 };
+export function newCounts(): MergeCounts {
+  return { contacts: 0, messages: 0, updates: 0, chunks: 0 };
+}
 
-  for (const item of bundle.contacts ?? []) {
+/** Index every message we already hold, so a merge stays linear. */
+export async function messageIndex(client: Client): Promise<Map<string, Message>> {
+  const known = new Map<string, Message>();
+  for (const message of await client.store.listAllMessages(client.identityId)) {
+    known.set(messageKey(message as unknown as Record<string, unknown>), message);
+  }
+  return known;
+}
+
+export async function mergeContacts(
+  client: Client,
+  items: Array<Record<string, unknown>> | undefined | null,
+  counts: MergeCounts,
+): Promise<void> {
+  for (const item of items ?? []) {
     if (await mergeContact(client, item)) counts.contacts += 1;
   }
+}
 
-  // Index what we already have, once, so a large bundle stays linear.
-  const known = new Map<string, Message>();
-  for (const contact of await client.store.listContacts(client.identityId)) {
-    for (const message of await client.store.listMessages(client.identityId, contact.id)) {
-      known.set(messageKey(message as unknown as Record<string, unknown>), message);
+export async function mergeChunks(
+  client: Client,
+  items: Array<{ id: string; ct: string }> | undefined | null,
+  counts: MergeCounts,
+): Promise<void> {
+  for (const chunk of items ?? []) {
+    const chunkId = String(chunk.id ?? '');
+    if (!chunkId) continue;
+    let ciphertext: Uint8Array;
+    try {
+      ciphertext = b64d(String(chunk.ct));
+    } catch {
+      throw new HistoryError('malformed attachment chunk in history bundle');
+    }
+    if (!(await client.store.hasLocalBlob(chunkId))) {
+      await client.store.putLocalBlob(chunkId, ciphertext);
+      counts.chunks += 1;
     }
   }
+}
 
-  for (const item of bundle.messages ?? []) {
+/** Merge message items, deduplicating on the shared message key.
+ *
+ * `known` is the index from {@link messageIndex}; it is updated in place so a
+ * stream of items (device back-fill) stays linear. */
+export async function mergeMessages(
+  client: Client,
+  items: Array<Record<string, unknown> | undefined | null> | undefined | null,
+  known: Map<string, Message>,
+  counts: MergeCounts,
+): Promise<void> {
+  for (const item of items ?? []) {
+    if (!item || !item.contact_id) continue;
     if (!item.contact_id) continue;
     const key = messageKey(item);
     const existing = known.get(key);
@@ -252,7 +293,8 @@ export async function mergeBundle(client: Client, bundle: Bundle): Promise<Merge
       }
       continue;
     }
-    const id = b64e(crypto.getRandomValues(new Uint8Array(16)));
+    // A mirrored message brings its own id so both devices agree on it.
+    const id = String(item.id ?? b64e(crypto.getRandomValues(new Uint8Array(16))));
     const message: Message = {
       id,
       identity_id: client.identityId,
@@ -269,22 +311,14 @@ export async function mergeBundle(client: Client, bundle: Bundle): Promise<Merge
     known.set(key, message);
     counts.messages += 1;
   }
+}
 
-  for (const chunk of bundle.chunks ?? []) {
-    const chunkId = String(chunk.id ?? '');
-    if (!chunkId) continue;
-    let ciphertext: Uint8Array;
-    try {
-      ciphertext = b64d(String(chunk.ct));
-    } catch {
-      throw new HistoryError('malformed attachment chunk in history bundle');
-    }
-    if (!(await client.store.hasLocalBlob(chunkId))) {
-      await client.store.putLocalBlob(chunkId, ciphertext);
-      counts.chunks += 1;
-    }
-  }
-
+export async function mergeBundle(client: Client, bundle: Bundle): Promise<MergeCounts> {
+  const counts = newCounts();
+  await mergeContacts(client, bundle.contacts, counts);
+  const known = await messageIndex(client);
+  await mergeMessages(client, bundle.messages, known, counts);
+  await mergeChunks(client, bundle.chunks, counts);
   return counts;
 }
 

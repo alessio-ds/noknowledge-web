@@ -6,7 +6,8 @@ drive a *reference* client against the same relay as the browser client. This
 is a test harness only: the web app never runs Python.
 
 Commands: init, add_contact, send_text, send_file, sync, contacts, messages,
-download, mark_read, export_history, import_history, quit.
+download, mark_read, export_history, import_history, device_id, request_history,
+history_requests, approve_history, sync_status, quit.
 """
 
 from __future__ import annotations
@@ -51,7 +52,13 @@ def handle(request: dict) -> dict:
         os.makedirs(data_dir, exist_ok=True)
         STATE["dir"] = data_dir
         identity_path = os.path.join(data_dir, "identity.nk")
-        if os.path.exists(identity_path):
+        if request.get("mnemonic"):
+            # The same account as another device under test.
+            identity = Identity.from_mnemonic(
+                request["mnemonic"], None, label=request.get("name")
+            )
+            identity.save(identity_path)
+        elif os.path.exists(identity_path):
             identity = Identity.load(identity_path)
         else:
             identity, _mnemonic = Identity.generate(label=request.get("name"))
@@ -89,6 +96,22 @@ def handle(request: dict) -> dict:
     if command == "mark_read":
         client.mark_read(request["contact"], request["message_id"])
         return {"ok": True}
+    if command == "card":
+        return {"ok": True, "card": client.card_string()}
+    if command == "device_id":
+        return {"ok": True, "device_id": client.device_id()}
+    if command == "request_history":
+        asked = client.request_history(since_ms=request.get("since_ms"))
+        return {"ok": True, "asked": asked}
+    if command == "history_requests":
+        return {"ok": True, "requests": client.history_requests()}
+    if command == "approve_history":
+        result = client.approve_history(
+            request["device_id"], since_ms=request.get("since_ms")
+        )
+        return {"ok": True, "result": result}
+    if command == "sync_status":
+        return {"ok": True, "status": client.sync_status()}
     if command == "export_history":
         # Written to a file so a large bundle never has to cross the line protocol.
         data = history_mod.export_history(

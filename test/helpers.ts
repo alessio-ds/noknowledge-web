@@ -120,7 +120,7 @@ export class PythonPeer {
   }
 
   static async start(
-    options: { relays: string[]; name: string; dataDir?: string },
+    options: { relays: string[]; name: string; dataDir?: string; mnemonic?: string },
   ): Promise<{ peer: PythonPeer; card: string; id: string }> {
     const dataDir = options.dataDir ?? mkdtempSync(path.join(tmpdir(), 'nk-peer-'));
     const child = spawn(PYTHON_BIN, [PEER_SCRIPT], {
@@ -138,6 +138,7 @@ export class PythonPeer {
       data_dir: dataDir,
       relays: options.relays,
       name: options.name,
+      mnemonic: options.mnemonic,
     });
     if (!result?.ok) throw new Error(`python peer init failed: ${JSON.stringify(result)}\n${peer.stderr}`);
     return { peer, card: result.card, id: result.id };

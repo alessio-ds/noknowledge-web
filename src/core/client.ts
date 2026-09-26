@@ -35,8 +35,10 @@ import {
   manifestDict,
 } from './attachments';
 import { CardError, ContactCard } from './card';
+import * as syncMod from './sync';
 import {
   DeviceEntry,
+  DeviceKeys,
   DeviceList,
   DeviceListError,
   LEGACY_DEVICE,
@@ -45,6 +47,7 @@ import {
   openDeviceList,
   sealDeviceList,
 } from './devices';
+import { isDeviceRecord } from './deviceChannel';
 import { Session } from './session';
 import type { Contact, LocalStore, Message, OutboxEntry } from './store';
 
@@ -112,6 +115,11 @@ export class Client {
   name: string;
 
   private readonly peerBackends = new Map<string, MultiRelayBackend>();
+  /** Sibling device key records, so mirroring does not refetch per message. */
+  readonly siblingKeyCache = new Map<string, { record: DeviceKeys; ts: number }>();
+  private deviceListCache: DeviceList | null = null;
+  private deviceListCacheTs = 0;
+  private syncMessageIndexCache: Promise<Map<string, Message>> | null = null;
   private ownInbox: MailboxCapability | null = null;
   private bundleId: string | null = null;
   private cardCache: ContactCard | null = null;
@@ -283,6 +291,38 @@ export class Client {
       // A relay refusing the record must not break provisioning; senders simply
       // fall back to the inbox in our contact card.
     }
+    this.deviceListCache = listing;
+    this.deviceListCacheTs = Date.now();
+    // Our own sync keys, so sibling devices can seal records to us.
+    await syncMod.publishDeviceKeys(this);
+  }
+
+  /** This account's device list, refetched at most every `maxAge` seconds.
+   *
+   * Mirroring and receipt handling look siblings up constantly, so going to the
+   * relay every time would put a round trip in the middle of a send. */
+  async ownDeviceList(maxAge = 300): Promise<DeviceList | null> {
+    if (this.deviceListCache && Date.now() - this.deviceListCacheTs < maxAge * 1000) {
+      return this.deviceListCache;
+    }
+    const listing = await this.fetchOwnDeviceList();
+    if (listing) {
+      this.deviceListCache = listing;
+      this.deviceListCacheTs = Date.now();
+    }
+    return listing ?? this.deviceListCache;
+  }
+
+  /** The message index of an in-flight back-fill, built once and shared. */
+  async syncMessageIndex(): Promise<Map<string, Message>> {
+    if (this.syncMessageIndexCache === null) {
+      this.syncMessageIndexCache = import('./history').then((mod) => mod.messageIndex(this));
+    }
+    return this.syncMessageIndexCache;
+  }
+
+  resetSyncMessageIndex(): void {
+    this.syncMessageIndexCache = null;
   }
 
   private async fetchOwnDeviceList(): Promise<DeviceList | null> {
@@ -568,12 +608,12 @@ export class Client {
   // -- sending ----------------------------------------------------------
 
   /** The write capability for one device's mailbox. */
-  private deviceCapability(device: DeviceEntry): MailboxCapability {
+  deviceCapability(device: DeviceEntry): MailboxCapability {
     return MailboxCapability.fromCardView(device.inbox);
   }
 
   /** A backend that can reach a peer, using the relays from *their* card. */
-  private backendFor(relays: string[] | null | undefined): MultiRelayBackend {
+  backendFor(relays: string[] | null | undefined): MultiRelayBackend {
     const urls = normalizeRelayUrls([...(relays ?? [])]);
     if (urls.length === 0) return this.backend;
     const key = urls.join('\n');
@@ -656,7 +696,18 @@ export class Client {
     for (const [device, blob] of blobs) {
       await this.queueOutbox(contact, device, messageId, blob);
     }
+    await this.mirrorSent(contactId, messageId);
     return messageId;
+  }
+
+  private async mirrorSent(contactId: string, messageId: string): Promise<void> {
+    const row = await this.store.getMessage(messageId);
+    if (!row) return;
+    try {
+      await syncMod.mirrorMessage(this, contactId, row);
+    } catch {
+      // Mirroring is a convenience: never fail a send over it.
+    }
   }
 
   sendFile(
@@ -733,6 +784,7 @@ export class Client {
     for (const [device, blob] of blobs) {
       await this.queueOutbox(contact, device, messageId, blob);
     }
+    await this.mirrorSent(contactId, messageId);
     return messageId;
   }
 
@@ -804,7 +856,19 @@ export class Client {
     for (const item of [...fetched].sort((a, b) => a.seq - b.seq)) {
       if (blocked.has(item.relay)) continue;
       try {
-        const message = await this.handleBlob(item.blob);
+        let message: Message | null = null;
+        if (isDeviceRecord(item.blob)) {
+          // A record from another device of this account. Its own failure modes
+          // (unknown device, bad signature, truncated transfer) must not block
+          // the mailbox; a truncated transfer is simply resumed later.
+          try {
+            await syncMod.handleRecord(this, item.blob);
+          } catch {
+            message = null;
+          }
+        } else {
+          message = await this.handleBlob(item.blob);
+        }
         if (message) newMessages.push(message);
         ackable[item.relay] = Math.max(ackable[item.relay] ?? 0, item.seq);
         this.retryCounts.delete(`${item.relay}:${item.seq}`);
@@ -977,6 +1041,14 @@ export class Client {
         await this.store.updateMessage(target, { state });
         // One row per device copy, all prefixed by the message id.
         await this.store.outboxRemoveForMessage(target);
+        const row = await this.store.getMessage(target);
+        if (row) {
+          try {
+            await syncMod.mirrorState(this, contact.id, row);
+          } catch {
+            /* best effort */
+          }
+        }
       }
       return null;
     }
@@ -1013,6 +1085,70 @@ export class Client {
     // remote_id; referencing our local id would be meaningless to them.
     const target = message.remote_id || messageId;
     await this.sendReceipt(contact, target, 'read');
+    // Our other devices should show this as read too.
+    try {
+      await syncMod.mirrorState(this, contactId, { ...message, state: 'read' });
+    } catch {
+      /* best effort */
+    }
+  }
+
+  // -- device sync ------------------------------------------------------
+
+  /** Ask this account's other devices for the past. */
+  requestHistory(sinceMs?: number | null): Promise<string[]> {
+    return this.runExclusive(async () => {
+      await this.provisionInner();
+      return syncMod.requestHistory(this, sinceMs);
+    });
+  }
+
+  /** Devices waiting for a human here to approve their history request. */
+  historyRequests(): Promise<syncMod.SyncRequest[]> {
+    return this.runExclusive(async () => {
+      await this.provisionInner();
+      return syncMod.pendingRequests(this);
+    });
+  }
+
+  /** Approve a device and send it the history it asked for. */
+  approveHistory(
+    deviceId: string,
+    sinceMs?: number | null,
+    onProgress?: (done: number, total: number) => void,
+  ): Promise<{ device_id: string; items: number; skipped: number }> {
+    return this.runExclusive(async () => {
+      await this.provisionInner();
+      return syncMod.approveDevice(this, deviceId, sinceMs, undefined, onProgress);
+    });
+  }
+
+  denyHistory(deviceId: string): Promise<void> {
+    return this.runExclusive(async () => {
+      await this.provisionInner();
+      await syncMod.denyDevice(this, deviceId);
+    });
+  }
+
+  revokeHistoryApproval(deviceId: string): Promise<void> {
+    return this.runExclusive(async () => {
+      await this.provisionInner();
+      await syncMod.revokeApproval(this, deviceId);
+    });
+  }
+
+  approvedDevices(): Promise<string[]> {
+    return this.runExclusive(async () => {
+      await this.provisionInner();
+      return syncMod.approvedDevices(this);
+    });
+  }
+
+  syncStatus(): Promise<syncMod.SyncStatus[]> {
+    return this.runExclusive(async () => {
+      await this.provisionInner();
+      return syncMod.syncStatus(this);
+    });
   }
 
   // -- reading ----------------------------------------------------------
