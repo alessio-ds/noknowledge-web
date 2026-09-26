@@ -379,11 +379,25 @@ export function Chat({
                 {client.identityId}
               </div>
             </div>
-            <span className={`badge ${status === 'online' ? 'online' : status === 'offline' ? 'offline' : ''}`}>
-              {status}
-            </span>
+            <div className="row" style={{ gap: 6 }}>
+              <span className={`badge ${status === 'online' ? 'online' : status === 'offline' ? 'offline' : ''}`}>
+                {status}
+              </span>
+              <button
+                className="icon"
+                data-testid="open-settings"
+                aria-label="Settings"
+                title="Settings"
+                onClick={() => {
+                  setShowSettings(true);
+                  setError(null);
+                }}
+              >
+                ⚙
+              </button>
+            </div>
           </div>
-          <div className="row" style={{ marginTop: 10 }}>
+          <div className="sidebar-actions" data-testid="sidebar-actions">
             <button className="secondary small" data-testid="my-card" onClick={openCard}>
               My card
             </button>
@@ -403,16 +417,6 @@ export function Chat({
               }}
             >
               Add contact
-            </button>
-            <button
-              className="ghost small"
-              data-testid="open-settings"
-              onClick={() => {
-                setShowSettings(true);
-                setError(null);
-              }}
-            >
-              Settings
             </button>
           </div>
         </div>

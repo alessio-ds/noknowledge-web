@@ -154,3 +154,61 @@ test('lists the account devices, and a recovered device joins them', async ({ br
   await second.close();
   await context.close();
 });
+
+test('the sidebar actions stay on one line and inside the sidebar', async ({ browser }) => {
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const page = await context.newPage();
+  await createAccount(page, 'Frank');
+
+  const layout = await page.evaluate(() => {
+    const row = document.querySelector('[data-testid="sidebar-actions"]') as HTMLElement;
+    const sidebar = document.querySelector('.sidebar') as HTMLElement;
+    const gear = document.querySelector('[data-testid="open-settings"]') as HTMLElement;
+    const idLabel = sidebar.querySelector('.id') as HTMLElement;
+    const buttons = Array.from(row.querySelectorAll('button')) as HTMLElement[];
+    return {
+      sidebarWidth: Math.round(sidebar.getBoundingClientRect().width),
+      sidebarRight: sidebar.getBoundingClientRect().right,
+      gearRight: Math.round(gear.getBoundingClientRect().right),
+      // A clipped identity id would mean the header no longer fits.
+      idOverflow: idLabel.scrollWidth - idLabel.clientWidth,
+      buttons: buttons.map((button) => {
+        const box = button.getBoundingClientRect();
+        // Height of the label itself, so padding cannot fake a single line.
+        const range = document.createRange();
+        range.selectNodeContents(button);
+        const textHeight = range.getBoundingClientRect().height;
+        return {
+          label: (button.textContent ?? '').trim(),
+          top: Math.round(box.top),
+          right: Math.round(box.right),
+          // scrollWidth > clientWidth means the label wrapped or clipped.
+          overflow: button.scrollWidth - button.clientWidth,
+          lines: Math.round(textHeight / parseFloat(getComputedStyle(button).lineHeight)),
+        };
+      }),
+    };
+  });
+
+  expect(layout.buttons.map((button) => button.label)).toEqual(['My card', 'Devices', 'Add contact']);
+  // Same line: every button shares one top edge.
+  expect(new Set(layout.buttons.map((button) => button.top)).size).toBe(1);
+  for (const button of layout.buttons) {
+    expect(button.overflow, `${button.label} wrapped or clipped`).toBeLessThanOrEqual(0);
+    expect(button.lines, `${button.label} is not on a single line`).toBe(1);
+    expect(button.right, `${button.label} runs past the sidebar`).toBeLessThanOrEqual(
+      layout.sidebarRight,
+    );
+  }
+
+  // The gear lives in the header and stays inside the sidebar.
+  expect(layout.sidebarWidth).toBeGreaterThanOrEqual(320);
+  expect(layout.gearRight).toBeLessThanOrEqual(layout.sidebarRight);
+  expect(layout.idOverflow).toBeLessThanOrEqual(0);
+
+  // Settings moved out of that row, and still opens the modal.
+  await page.getByTestId('open-settings').click();
+  await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible();
+
+  await context.close();
+});

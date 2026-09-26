@@ -32,6 +32,8 @@ button {
   border-radius: 10px;
   padding: 9px 14px;
   cursor: pointer;
+  /* A label must never break mid-phrase; rows wrap as whole buttons instead. */
+  white-space: nowrap;
 }
 button:hover { background: var(--accent-2); }
 button:disabled { opacity: .5; cursor: not-allowed; }
@@ -39,7 +41,7 @@ button.secondary { background: var(--panel-2); border: 1px solid var(--line); }
 button.secondary:hover { background: #232833; }
 button.ghost { background: transparent; border: 1px solid var(--line); }
 button.ghost:hover { background: var(--panel-2); }
-button.icon { background: transparent; font-size: 20px; line-height: 1; padding: 2px 8px; color: var(--muted); }
+button.icon { background: transparent; font-size: 17px; line-height: 1; padding: 2px 6px; color: var(--muted); }
 button.icon:hover { background: transparent; color: var(--text); }
 
 input, textarea, select {
@@ -80,9 +82,13 @@ a { color: var(--accent); }
 .mnemonic b { color: var(--muted); font-weight: 500; margin-right: 6px; }
 
 /* app shell */
-.app { display: grid; grid-template-columns: 300px 1fr; height: 100%; }
+.app { display: grid; grid-template-columns: 340px 1fr; height: 100%; }
 .sidebar { border-right: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
 .sidebar-head { padding: 14px; border-bottom: 1px solid var(--line); }
+/* Three equal actions on one line; on a very narrow window they wrap as whole
+   buttons rather than splitting a label across two lines. */
+.sidebar-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.sidebar-actions button { flex: 1 1 auto; padding: 7px 10px; font-size: 12.5px; }
 .me { font-weight: 600; }
 .contacts { overflow-y: auto; flex: 1; }
 .contact { padding: 12px 14px; border-bottom: 1px solid var(--line); cursor: pointer; }
